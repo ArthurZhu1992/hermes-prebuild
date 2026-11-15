@@ -16,6 +16,8 @@
 #   ./hermes-update.sh --proxy 127.0.0.1:7890        # 指定代理（ip:port 默认 http）
 #   ./hermes-update.sh --proxy socks5://10.0.0.2:1080
 #   ./hermes-update.sh --no-proxy           # 忽略系统代理，强制直连
+#   ./hermes-update.sh --source release     # auto(默认) | artifact | release
+#
 #
 # 代理来源优先级：--proxy > 环境变量(HTTPS_PROXY/ALL_PROXY/HTTP_PROXY) > GNOME 系统代理 > 直连
 set -uo pipefail
@@ -24,6 +26,7 @@ BUILDER_REPO="${BUILDER_REPO:-ArthurZhu1992/hermes-prebuild}"
 UPSTREAM="${UPSTREAM:-NousResearch/hermes-agent}"
 REF=""; DIAGNOSE=0; DRY_RUN=0; YES=0; SKIP_UPDATE=0; ROLLBACK=0
 PROXY_URL="${PROXY_URL:-}"; SKIP_PROXY=0
+SOURCE="${SOURCE:-auto}"   # auto | artifact | release
 STAMP_TS=$(date +%Y%m%d-%H%M%S)
 
 while [ $# -gt 0 ]; do
@@ -33,6 +36,8 @@ while [ $# -gt 0 ]; do
     --proxy) PROXY_URL="$2"; shift 2;;
     --proxy=*) PROXY_URL="${1#*=}"; shift;;
     --no-proxy) SKIP_PROXY=1; shift;;
+    --source) SOURCE="$2"; shift 2;;
+    --source=*) SOURCE="${1#*=}"; shift;;
     --diagnose) DIAGNOSE=1; shift;;
     --dry-run) DRY_RUN=1; shift;;
     -y|--yes) YES=1; shift;;
@@ -210,19 +215,42 @@ find_artifact() {
         ".artifacts[] | select(.name==\"$want\" and .expired==false) | \"\(.id) \(.size_in_bytes)\"" \
         | sort -k1 -n | tail -1)
   [ -n "${ART:-}" ] || return 1
-  ART_ID=${ART%% *}; ART_SIZE=${ART##* }; ART_NAME="$want"
+  ART_ID=${ART%% *}; ART_SIZE=${ART##* }; ART_NAME="$want"; PAYLOAD_KIND=artifact
+}
+
+# release 通道：资产名 = <artifact 名>.zip，走 browser_download_url（公开仓库匿名可下、不过期）
+find_release_asset() {
+  local want_zip="$want.zip" jqf url size
+  jqf=".assets[] | select(.name==\"$want_zip\")"
+  url=$(api_get "repos/$BUILDER_REPO/releases/tags/prebuild" "$jqf | .browser_download_url" 2>/dev/null)
+  [ -n "${url:-}" ] || return 1
+  size=$(api_get "repos/$BUILDER_REPO/releases/tags/prebuild" "$jqf | .size" 2>/dev/null)
+  ART_URL="$url"; ART_NAME="$want_zip"; ART_SIZE="${size:-0}"; PAYLOAD_KIND=release
+}
+
+locate_payload() {
+  case "$SOURCE" in
+    artifact) find_artifact ;;
+    release)  find_release_asset ;;
+    *)        find_artifact || find_release_asset ;;
+  esac
 }
 
 # ─── 3. 下载 + 校验 ─────────────────────────────────────────────────────────
 download() {
   TMP=$(mktemp -d "/tmp/hermes-prebuild.XXXXXX")
   local px=(); [ -n "$PX" ] && px=(-x "$PX")
-  token="$TOKEN"
-  say "  下载 $ART_NAME（$((ART_SIZE/1024/1024)) MB）${PX:+（经代理 $PX）}..."
-  curl -fsSL ${px[@]+"${px[@]}"} -H "Authorization: token $token" -H "Accept: application/zip" \
-       --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 \
-       -o "$TMP/payload.zip" "https://api.github.com/repos/$BUILDER_REPO/actions/artifacts/$ART_ID/zip" \
-       || die '下载失败（换个 --proxy 或检查 gh auth）'
+  say "  下载 $ART_NAME（$((ART_SIZE/1024/1024)) MB，通道=$PAYLOAD_KIND）${PX:+（经代理 $PX）}..."
+  if [ "$PAYLOAD_KIND" = release ]; then
+    curl -fsSL ${px[@]+"${px[@]}"} --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 \
+         -o "$TMP/payload.zip" "$ART_URL" \
+         || die 'release 资产下载失败（国内直连常 0 B/s，加 --proxy 再试）'
+  else
+    curl -fsSL ${px[@]+"${px[@]}"} -H "Authorization: token $TOKEN" -H "Accept: application/zip" \
+         --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 \
+         -o "$TMP/payload.zip" "https://api.github.com/repos/$BUILDER_REPO/actions/artifacts/$ART_ID/zip" \
+         || die '下载失败（换个 --proxy 或检查 gh auth）'
+  fi
   mkdir -p "$TMP/x"
   if command -v unzip >/dev/null; then unzip -q "$TMP/payload.zip" -d "$TMP/x"
   else python3 -c "import zipfile,sys;zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$TMP/payload.zip" "$TMP/x"; fi
@@ -367,12 +395,12 @@ head_ ''
 c '0;36' "目标：$T_REF @ ${T_SHA:0:12}"
 [ "$(jget commit)" = "$T_SHA" ] && warn '本机已经在这个 commit 上，覆盖没有意义（除非产物丢了）'
 
-if ! find_artifact; then
+if ! locate_payload; then
   warn "找不到产物 ${T_SHA:0:12}（CI 还没编这个 SHA，或已过期）"
   say "  处理：gh workflow run prebuild.yml -R $BUILDER_REPO -f ref=$T_REF"
   exit 1
 fi
-ok "找到产物 $ART_NAME（$((ART_SIZE/1024/1024)) MB, id=$ART_ID）"
+ok "找到产物 $ART_NAME（$((ART_SIZE/1024/1024)) MB，通道=$PAYLOAD_KIND）"
 
 download
 verify || { warn '产物校验不过 → 不覆盖，保持现状（下次 hermes update 会本地全量编译）'; exit 1; }

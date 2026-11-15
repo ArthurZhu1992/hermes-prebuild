@@ -28,6 +28,7 @@ param(
   [switch]$SkipUpdate,
   [switch]$Rollback,
   [string]$Proxy,                        # 例：http://127.0.0.1:7890 / socks5://10.0.0.2:1080
+  [ValidateSet('auto','artifact','release')][string]$Source = 'auto',   # 产物来源通道
   [switch]$NoProxy,                      # 忽略系统代理，强制直连
   [string]$BuilderRepo = 'ArthurZhu1992/hermes-prebuild',
   [string]$Upstream    = 'NousResearch/hermes-agent'
@@ -219,7 +220,29 @@ function Find-Artifact($i, $short) {
   $resp = Api-Get "repos/$BuilderRepo/actions/artifacts?per_page=100"
   $hit = @($resp.artifacts | Where-Object { $_.name -eq $kind -and -not $_.expired } | Sort-Object id -Descending)[0]
   if (-not $hit) { return $null }
-  [pscustomobject]@{ Id = $hit.id; Name = $hit.name; Expired = $hit.expired; Size = [int64]$hit.size_in_bytes }
+  [pscustomobject]@{ Id = $hit.id; Name = $hit.name; Expired = $hit.expired; Size = [int64]$hit.size_in_bytes; Kind = 'artifact'; Url = $null }
+}
+
+# release 通道：资产名 = <artifact 名>.zip，走 browser_download_url（公开仓库匿名可下、不过期）
+function Find-ReleaseAsset($i, $short) {
+  $kind = if ($i.Desktop) { "hermes-win-$Arch-$short" } else { "hermes-cli-win-$Arch-$short" }
+  $zipName = "$kind.zip"
+  try { $rel = Api-Get "repos/$BuilderRepo/releases/tags/prebuild" } catch { return $null }
+  $a = @($rel.assets | Where-Object { $_.name -eq $zipName })[0]
+  if (-not $a) { return $null }
+  [pscustomobject]@{ Id = $null; Name = $a.name; Expired = $false; Size = [int64]$a.size; Kind = 'release'; Url = $a.browser_download_url }
+}
+
+function Locate-Payload($i, $short) {
+  switch ($Source.ToLower()) {
+    'artifact' { Find-Artifact $i $short }
+    'release'  { Find-ReleaseAsset $i $short }
+    default {
+      $a = Find-Artifact $i $short
+      if (-not $a) { $a = Find-ReleaseAsset $i $short }
+      $a
+    }
+  }
 }
 
 # ─── 4. 下载 + 校验 ─────────────────────────────────────────────────────────
@@ -229,12 +252,17 @@ function Get-Artifact($art) {
   New-Item -ItemType Directory -Force -Path $tmp | Out-Null
   $zip = Join-Path $tmp 'payload.zip'
   $token = $script:Token
-  Say ("  下载 {0}（{1:N0} MB）..." -f $art.Name, ($art.Size / 1MB))
+  Say ("  下载 {0}（{1:N0} MB，通道={2}）..." -f $art.Name, ($art.Size / 1MB), $art.Kind)
   $curlProxy = @()
   if ($script:ProxyUrl) { $curlProxy = @('-x', $script:ProxyUrl) }
-  & curl.exe -fsSL @curlProxy -H "Authorization: token $token" -H "Accept: application/zip" `
-    --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 `
-    -o $zip "https://api.github.com/repos/$BuilderRepo/actions/artifacts/$($art.Id)/zip"
+  if ($art.Kind -eq 'release') {
+    & curl.exe -fsSL @curlProxy --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 `
+      -o $zip $art.Url
+  } else {
+    & curl.exe -fsSL @curlProxy -H "Authorization: token $token" -H "Accept: application/zip" `
+      --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 `
+      -o $zip "https://api.github.com/repos/$BuilderRepo/actions/artifacts/$($art.Id)/zip"
+  }
   if ($LASTEXITCODE -ne 0) { Fail "下载失败（curl 退出码 $LASTEXITCODE）" }
   Expand-Archive -Path $zip -DestinationPath (Join-Path $tmp 'x') -Force
   Ok ("已解包到 {0}" -f (Join-Path $tmp 'x'))
@@ -396,14 +424,14 @@ Say ''
 Say ("目标：{0} @ {1}" -f $target.Ref, $target.Sha.Substring(0, 12)) 'Cyan'
 if ($i.Commit -eq $target.Sha) { Warn '本机已经在这个 commit 上，覆盖没有意义（除非产物丢了）' }
 
-$art = Find-Artifact $i $target.Sha.Substring(0, 12)
+$art = Locate-Payload $i $target.Sha.Substring(0, 12)
 if (-not $art) {
   Warn ("找不到产物 {0}（CI 可能还没编这个 SHA，或已过期）" -f $target.Sha.Substring(0, 12))
   Say '  处理：在 hermes-prebuild 上手动 dispatch：' 'Yellow'
   Say ("    gh workflow run prebuild.yml -R {0} -f ref={1}" -f $BuilderRepo, $target.Ref) 'Yellow'
   return
 }
-Ok ("找到产物 {0}（{1:N0} MB, id={2}）" -f $art.Name, ($art.Size / 1MB), $art.Id)
+Ok ("找到产物 {0}（{1:N0} MB，通道={2}）" -f $art.Name, ($art.Size / 1MB), $art.Kind)
 
 $root = Get-Artifact $art
 if (-not (Verify-Payload $root $target $i)) {

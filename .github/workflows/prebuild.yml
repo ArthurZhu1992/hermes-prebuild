@@ -302,3 +302,51 @@ jobs:
             fi
           done < <(gh api "repos/${{ github.repository }}/actions/artifacts?per_page=100"                      --jq '.artifacts[] | "\(.id) \(.name)"')
           echo "保留 $kept 份（当前 SHA $SHORT），删除 $deleted 份"
+  # ── 双写：同一批产物再发一份到单一 release（永久、匿名可下、可回退）──────────
+  publish:
+    needs: [resolve, build-win, build-linux]
+    if: needs.build-win.result == 'success' && needs.build-linux.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: 重新打包成 release 资产（文件名带 sha12）
+        run: |
+          set -euo pipefail
+          cd dist
+          for d in */; do
+            n=${d%/}
+            python3 -c "import shutil,sys; shutil.make_archive(sys.argv[1],'zip','.',sys.argv[1])" "$n"
+          done
+          ls -la *.zip
+
+      - name: 上传到 release「prebuild」
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          SHORT: ${{ needs.resolve.outputs.short }}
+          REF: ${{ needs.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          R="${{ github.repository }}"
+          if ! gh release view prebuild -R "$R" >/dev/null 2>&1; then
+            gh release create prebuild -R "$R" --prerelease --title "预编译产物（滚动）" --notes "每个资产对应一个上游 commit，文件名带 sha12；只保留最近 3 个 SHA。脚本可用 --source release 从这里下载。"
+          fi
+          python3 -c "import json,os,datetime;print(json.dumps({'ref':os.environ['REF'],'sha':os.environ['SHA'],'short':os.environ['SHORT'],'built_at':datetime.datetime.now(datetime.UTC).isoformat(),'assets':sorted(f for f in os.listdir('dist') if f.endswith('.zip'))},indent=2))" > latest.json
+          gh release upload prebuild dist/*.zip latest.json -R "$R" --clobber
+          echo "--- release 现有资产 ---"
+          gh release view prebuild -R "$R" --json assets --jq '.assets[]|"\(.name)	\(.size)"'
+
+      - name: 只保留最近 9 个资产（3 个 SHA）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          R="${{ github.repository }}"
+          gh release view prebuild -R "$R" --json assets --jq '.assets | sort_by(.createdAt) | reverse | .[9:] | .[].name' > old.txt
+          while read -r name; do
+            [ -z "$name" ] && continue
+            gh release delete-asset prebuild "$name" -R "$R" --yes && echo "deleted $name"
+          done < old.txt

@@ -21,6 +21,23 @@
 | `hermes-linux-x64-<sha12>` | 同上，`linux-unpacked` | ~150 MB |
 | `hermes-cli-linux-<sha12>` | 只有 `hermes_cli/web_dist` + `ui-tui/dist`（纯 CLI 机器，无 Electron） | ~8 MB |
 
+同一批产物还会**双写**到单一 release：**https://github.com/ArthurZhu1992/hermes-prebuild/releases/tag/prebuild**
+
+| 通道 | 位置 | 有效期 | 下载是否需要登录 | 实际走哪个域 |
+|---|---|---|---|---|
+| artifact | Actions 产物 | 7 天 | **需要** | Azure blob（国内常可达） |
+| release | `prebuild` release，资产名带 sha12 | **永久** | **不需要**，匿名直链 | objects.githubusercontent（国内常被判 0 B/s） |
+
+release 里只保留最近 3 个 SHA 的资产（9 个文件）+ `latest.json`（记录当前 SHA/ref/构建时间）。
+
+脚本用 `--source` 选通道（PS 是 `-Source`）：
+
+```bash
+./hermes-update.sh --source auto       # 默认：先 artifact，找不到再 release
+./hermes-update.sh --source release    # 强制走 release（匿名直链）
+./hermes-update.sh --source artifact   # 强制走 Actions 产物
+```
+
 每个 artifact 根目录有 `manifest.json`：
 
 ```json
