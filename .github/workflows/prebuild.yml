@@ -258,7 +258,8 @@ jobs:
           git config user.email "hermes-prebuild@users.noreply.github.com"
           git add state/last-built.json
           git commit -m "state: $REF @ $SHORT" || echo "nothing to commit"
-          git push
+          git pull --rebase --autostash -q || true
+          git push || (git pull --rebase --autostash -q && git push)
 
       - name: 清理旧 artifact（只留当前这个 SHA 的三份）
         env:
