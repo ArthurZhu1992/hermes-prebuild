@@ -88,9 +88,10 @@ def main():
         print(f"  ── {hit}  ({usize} B)")
         try:
             obj = json.loads(raw)
-            keys = {k: obj[k] for k in ("commit", "payload", "updateMechanism", "displayVersion",
-                                        "baseVersion", "distance", "product", "platform", "arch",
-                                        "node", "ref", "sha", "built_at") if k in obj}
+            keys = {k: obj[k] for k in ("commit", "branch", "source", "dirty", "payload",
+                                        "updateMechanism", "distribution", "tag", "schemaVersion",
+                                        "displayVersion", "baseVersion", "distance", "product",
+                                        "platform", "arch", "node", "ref", "sha", "built_at") if k in obj}
             print("     ", json.dumps(keys, ensure_ascii=False))
         except Exception:
             print("     ", raw[:200])

@@ -103,15 +103,13 @@ jobs:
 
       - name: 构建（与 hermes update 同一套函数）
         working-directory: src
-        # GITHUB_SHA/GITHUB_REF_NAME 必须清空：write-build-stamp.mjs 的 fromCI() 会把
-        # 「本仓库（builder）的提交」当成她的提交烘进 stamp，导致 source=ci / commit=错的 SHA，
-        # 目标机上 stampDrift 与本地构建不一致 → 复用判定永远失败。清空后走 fromLocalGit()，
-        # 与目标机本地构建逐字段一致（source=local, branch=main 或 detached→null）。
-        env:
-          GITHUB_SHA: ''
-          GITHUB_REF_NAME: ''
-          GITHUB_HEAD_REF: ''
+        # GITHUB_SHA 是 GitHub 的默认环境变量，workflow 的 env: 覆盖不了（官方限制），
+        # 只能在进程内 unset。否则 write-build-stamp.mjs 的 fromCI() 会把「builder 仓库的提交」
+        # 烘进 stamp（source=ci / commit 错），目标机上 stampDrift 永远不匹配 → 复用失效。
         run: |
+          $env:GITHUB_SHA = $null
+          $env:GITHUB_REF_NAME = $null
+          $env:GITHUB_HEAD_REF = $null
           .venv\Scripts\python.exe -c "from pathlib import Path; from hermes_cli.source_build import build_update_products; build_update_products(Path('.').resolve(), desktop=True)"
 
       - name: 写 manifest
@@ -191,13 +189,9 @@ jobs:
 
       - name: 构建
         working-directory: src
-        # 同 build-win：清空 GITHUB_SHA 等，避免 fromCI() 把 builder 仓库的提交烘进 stamp
-        env:
-          GITHUB_SHA: ''
-          GITHUB_REF_NAME: ''
-          GITHUB_HEAD_REF: ''
+        # 同 build-win：GITHUB_SHA 无法用 env: 覆盖，必须在进程内 unset，让 stamp 走 fromLocalGit()
         run: |
-          .venv/bin/python -c "from pathlib import Path; from hermes_cli.source_build import build_update_products; build_update_products(Path('.').resolve(), desktop=True)"
+          env -u GITHUB_SHA -u GITHUB_REF_NAME -u GITHUB_HEAD_REF             .venv/bin/python -c "from pathlib import Path; from hermes_cli.source_build import build_update_products; build_update_products(Path('.').resolve(), desktop=True)"
 
       - name: 写 manifest + 收集产物
         working-directory: src
