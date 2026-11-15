@@ -43,6 +43,7 @@ jobs:
       short: ${{ steps.r.outputs.short }}
       changed: ${{ steps.r.outputs.changed }}
       ref: ${{ steps.r.outputs.ref }}
+      version: ${{ steps.r.outputs.version }}
     steps:
       - uses: actions/checkout@v4          # 本仓库，为了读 state/
       - id: r
@@ -50,18 +51,43 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REF: ${{ inputs.ref || 'main' }}
           FORCE: ${{ inputs.force || 'false' }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
-          sha=$(gh api "repos/NousResearch/hermes-agent/commits/$REF" --jq .sha)
+          UP=NousResearch/hermes-agent
+          main_sha=$(gh api "repos/$UP/commits/main" --jq .sha)
+          tag=$(gh api "repos/$UP/releases/latest" --jq .tag_name)
+          tag_sha=$(gh api "repos/$UP/commits/$tag" --jq .sha)
+          last_main=$(jq -r '."main".sha // "none"' state/last-built.json 2>/dev/null || echo none)
+          last_tag=$(jq -r --arg t "$tag" '.[$t].sha // "none"' state/last-built.json 2>/dev/null || echo none)
+
+          if [ -n "${INPUT_REF:-}" ]; then
+            ref="$INPUT_REF"; sha=$(gh api "repos/$UP/commits/$ref" --jq .sha); changed=true
+            echo "手动指定 ref=$ref"
+          elif [ "$main_sha" != "$last_main" ]; then
+            ref=main; sha="$main_sha"; changed=true
+            echo "main 有更新：$last_main -> $main_sha"
+          elif [ "$tag_sha" != "$last_tag" ]; then
+            ref="$tag"; sha="$tag_sha"; changed=true
+            echo "stable 有新版本：$tag（$last_tag -> $tag_sha）"
+          else
+            ref=main; sha="$main_sha"; changed=false
+            echo "main 与 stable 都没变，跳过"
+          fi
+          if [ "$FORCE" = "true" ]; then changed=true; fi
+
           short=${sha:0:12}
-          last=$(jq -r --arg ref "$REF" '.[$ref].sha // "none"' state/last-built.json 2>/dev/null || echo none)
-          changed=true
-          if [ "$sha" = "$last" ] && [ "$FORCE" != "true" ]; then changed=false; fi
-          echo "sha=$sha"     >> "$GITHUB_OUTPUT"
-          echo "short=$short" >> "$GITHUB_OUTPUT"
-          echo "changed=$changed" >> "$GITHUB_OUTPUT"
-          echo "ref=$REF"     >> "$GITHUB_OUTPUT"
-          echo "ref=$REF sha=$sha last=$last changed=$changed"
+          if [ "$sha" = "$tag_sha" ]; then version="$tag"
+          else
+            ahead=$(gh api "repos/$UP/compare/$tag...$sha" --jq .ahead_by 2>/dev/null || echo 0)
+            version="${tag}+${ahead}.g${sha:0:7}"
+          fi
+
+          {
+            echo "sha=$sha"; echo "short=$short"; echo "ref=$ref"
+            echo "changed=$changed"; echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "ref=$ref sha=$sha version=$version changed=$changed"
 
   # ── Windows 桌面壳 ────────────────────────────────────────────────────────
   build-win:
@@ -73,6 +99,7 @@ jobs:
       REF: ${{ needs.resolve.outputs.ref }}
       SHA: ${{ needs.resolve.outputs.sha }}
       SHORT: ${{ needs.resolve.outputs.short }}
+      VERSION: ${{ needs.resolve.outputs.version }}
       PYTHONUTF8: '1'
     steps:
       - name: 取上游源码
@@ -129,7 +156,7 @@ jobs:
         run: |
           $node = (Get-Content pm/lock.json -Raw | ConvertFrom-Json).packages.node.version
           $m = [ordered]@{
-            ref = $env:REF; sha = $env:SHA; platform = 'win32'; arch = 'x64'
+            ref = $env:REF; sha = $env:SHA; version = $env:VERSION; platform = 'win32'; arch = 'x64'
             node = $node; built_at = (Get-Date).ToUniversalTime().ToString('o')
             workflow_run = $env:GITHUB_RUN_ID
           }
@@ -167,6 +194,7 @@ jobs:
       REF: ${{ needs.resolve.outputs.ref }}
       SHA: ${{ needs.resolve.outputs.sha }}
       SHORT: ${{ needs.resolve.outputs.short }}
+      VERSION: ${{ needs.resolve.outputs.version }}
     steps:
       - name: 取上游源码
         uses: actions/checkout@v4
@@ -223,7 +251,7 @@ jobs:
           mkdir -p out
           python - "$node" <<'PY'
           import json,os,sys,datetime
-          json.dump({"ref":os.environ["REF"],"sha":os.environ["SHA"],"platform":"linux","arch":"x64",
+          json.dump({"ref":os.environ["REF"],"sha":os.environ["SHA"],"version":os.environ.get("VERSION",""),"platform":"linux","arch":"x64",
                      "node":sys.argv[1],"built_at":datetime.datetime.now(datetime.UTC).isoformat(),
                      "workflow_run":os.environ["GITHUB_RUN_ID"]}, open("out/manifest.json","w"), indent=2)
           PY
@@ -302,6 +330,7 @@ jobs:
             fi
           done < <(gh api "repos/${{ github.repository }}/actions/artifacts?per_page=100"                      --jq '.artifacts[] | "\(.id) \(.name)"')
           echo "保留 $kept 份（当前 SHA $SHORT），删除 $deleted 份"
+
   # ── 双写：同一批产物再发一份到单一 release（永久、匿名可下、可回退）──────────
   publish:
     needs: [resolve, build-win, build-linux]
@@ -322,22 +351,47 @@ jobs:
           done
           ls -la *.zip
 
-      - name: 上传到 release「prebuild」
+      - name: 上传到 release「prebuild」（标题带版本号）
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ needs.resolve.outputs.sha }}
           SHORT: ${{ needs.resolve.outputs.short }}
           REF: ${{ needs.resolve.outputs.ref }}
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           set -euo pipefail
           R="${{ github.repository }}"
           if ! gh release view prebuild -R "$R" >/dev/null 2>&1; then
-            gh release create prebuild -R "$R" --prerelease --title "预编译产物（滚动）" --notes "每个资产对应一个上游 commit，文件名带 sha12；只保留最近 3 个 SHA。脚本可用 --source release 从这里下载。"
+            gh release create prebuild -R "$R" --prerelease --title "预编译产物（滚动）" --notes "首次构建。"
           fi
-          python3 -c "import json,os,datetime;print(json.dumps({'ref':os.environ['REF'],'sha':os.environ['SHA'],'short':os.environ['SHORT'],'built_at':datetime.datetime.now(datetime.UTC).isoformat(),'assets':sorted(f for f in os.listdir('dist') if f.endswith('.zip'))},indent=2))" > latest.json
+
+          # latest.json —— 脚本用它显示版本号
+          printf '{\n  "ref": "%s",\n  "sha": "%s",\n  "short": "%s",\n  "version": "%s",\n  "built_at": "%s",\n  "assets": [' \
+            "$REF" "$SHA" "$SHORT" "$VERSION" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > latest.json
+          first=1
+          for f in dist/*.zip; do
+            [ "$first" = 1 ] || printf ',' >> latest.json
+            first=0
+            printf '\n    "%s"' "$(basename "$f")" >> latest.json
+          done
+          printf '\n  ]\n}\n' >> latest.json
+
+          # release 说明：版本号 + 本次资产表
+          {
+            printf '**版本 `%s`** · 上游 `%s` @ `%s`\n\n' "$VERSION" "$REF" "${SHA:0:12}"
+            printf '| 资产 | 大小 |\n|---|---|\n'
+            for f in dist/*.zip; do
+              printf '| `%s` | %s MB |\n' "$(basename "$f")" "$(( $(stat -c%s "$f") / 1048576 ))"
+            done
+            printf '\n构建时间 %s\n\n' "$(date -u '+%Y-%m-%d %H:%M UTC')"
+            printf '用法：`./hermes-update.sh --source release`（PS 里 `-Source release`），脚本按 sha12 自动挑资产。\n'
+            printf '只保留最近 3 个 SHA 的资产。\n'
+          } > notes.md
+
           gh release upload prebuild dist/*.zip latest.json -R "$R" --clobber
+          gh release edit prebuild -R "$R" --title "预编译产物 · $REF $VERSION" --notes-file notes.md
           echo "--- release 现有资产 ---"
-          gh release view prebuild -R "$R" --json assets --jq '.assets[]|"\(.name)	\(.size)"'
+          gh release view prebuild -R "$R" --json assets --jq '.assets[]|"\(.name)\t\(.size)"'
 
       - name: 只保留最近 9 个资产（3 个 SHA）
         env:

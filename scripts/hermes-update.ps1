@@ -429,6 +429,12 @@ if (-not $art) {
   return
 }
 Ok ("找到产物 {0}（{1:N0} MB，通道={2}）" -f $art.Name, ($art.Size / 1MB), $art.Kind)
+try {
+  $prevEap2 = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  $lj = Invoke-RestMethod -Uri "https://github.com/$BuilderRepo/releases/download/prebuild/latest.json" -TimeoutSec 30
+  $ErrorActionPreference = $prevEap2
+  if ($lj.sha -eq $target.Sha) { Ok ("对应版本：{0}" -f $lj.version) }
+} catch {}
 
 $root = Get-Artifact $art
 if (-not (Verify-Payload $root $target $i)) {

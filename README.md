@@ -11,6 +11,25 @@
 
 ---
 
+## 0. 快速上手（30 秒）
+
+```bash
+# Linux
+curl -fsSLO https://raw.githubusercontent.com/ArthurZhu1992/hermes-prebuild/main/scripts/hermes-update.sh
+chmod +x hermes-update.sh
+./hermes-update.sh --diagnose            # 只读：看本机安装状态
+./hermes-update.sh --ref v0.23.1 --yes   # 覆盖 + hermes update
+```
+
+```powershell
+# Windows
+irm https://raw.githubusercontent.com/ArthurZhu1992/hermes-prebuild/main/scripts/hermes-update.ps1 -OutFile hermes-update.ps1
+powershell -ExecutionPolicy Bypass -File .\hermes-update.ps1 -Diagnose
+powershell -ExecutionPolicy Bypass -File .\hermes-update.ps1 -Ref v0.23.1 -Yes
+```
+
+不带参数运行 = 交互菜单。**不需要 GitHub token**：产物走 release 匿名直链，公开 API 匿名配额够用。
+
 ## 1. 产物
 
 每次构建按 ref 产三种 artifact（名字 = `hermes-<os>-<arch>-<sha12>`，保留 7 天）：
@@ -22,6 +41,15 @@
 | `hermes-cli-linux-<sha12>` | 只有 `hermes_cli/web_dist` + `ui-tui/dist`（纯 CLI 机器，无 Electron） | ~8 MB |
 
 同一批产物还会**双写**到单一 release：**https://github.com/ArthurZhu1992/hermes-prebuild/releases/tag/prebuild**
+
+release 标题直接带版本号（每次构建刷新）：
+
+```
+预编译产物 · main v0.23.2+416.ga347930      ← main 线：最近正式版 + 距离 + 短 sha
+预编译产物 · v0.23.1 v0.23.1                ← stable 线：就是那个 tag
+```
+
+`latest.json` 里是机器可读的同一份信息：`{ref, sha, short, version, built_at, assets[]}`。
 
 | 通道 | 位置 | 有效期 | 下载是否需要登录 | 实际走哪个域 |
 |---|---|---|---|---|
@@ -49,7 +77,7 @@ release 里只保留最近 3 个 SHA 的资产（9 个文件）+ `latest.json`�
 
 | 方式 | 说明 |
 |---|---|
-| `schedule`（每天 03:17 UTC） | 检查上游 `main`；SHA 没变就 10 秒早退，不浪费 runner |
+| `schedule`（每天 03:17 UTC） | 先看 main 有没有新 commit；没有再看 stable 是否发了新 tag；两者都没变就 10 秒早退 |
 | `workflow_dispatch` | 手动指定任意 `ref`（分支 / tag / SHA），stable 发版后出包用这个 |
 
 ```bash
@@ -103,6 +131,7 @@ chmod +x hermes-update.sh && ./hermes-update.sh
   3) 下载覆盖 + 运行 hermes update（推荐）
   4) 选一个具体 tag/SHA 再执行
   5) 回滚到上一次备份
+  6) 手动指定代理（ip:端口 / http://… / socks5://…，留空=直连）
   0) 退出
 ```
 
@@ -123,16 +152,12 @@ chmod +x hermes-update.sh && ./hermes-update.sh
 .\hermes-update.ps1 -Rollback
 ```
 
-### 没装 gh 也能用
+### 要 token 吗
 
-脚本优先用 `gh`；没有 `gh` 时自动退化到 `curl` + `jq` + `GITHUB_TOKEN`：
+**不需要。** release 通道匿名可下，公开 API 匿名 60 次/小时够这个脚本用。
+只有强制 `--source artifact` 才需要 token（`gh auth login` 或 `export GITHUB_TOKEN=…`）。
 
-```bash
-export GITHUB_TOKEN=ghp_xxx      # 只需 repo 读权限（公开仓库其实用无权限 token 也行）
-./hermes-update.sh
-```
-
-Windows 侧同理：`$env:GITHUB_TOKEN = 'ghp_xxx'`，或装 gh 后 `gh auth login` 一次即可。
+没有 `gh` 也行：脚本自动退化到 `curl` + `jq`；两者都没有时会提示你装哪个。
 
 环境变量可覆盖仓库名：`BUILDER_REPO`（bash）/ 参数 `-BuilderRepo`（PS）。
 
@@ -174,7 +199,7 @@ Windows 侧同理：`$env:GITHUB_TOKEN = 'ghp_xxx'`，或装 gh 后 `gh auth log
 
 ## 5. 前置条件与边界
 
-- 目标机需要 `gh` 且 `gh auth login` 过（脚本用 `gh auth token` 拉 artifact）
+- 目标机**不需要** `gh`/token（release 通道匿名可下）；强制 `--source artifact` 才需要用 token
 - 覆盖前必须退出桌面应用（Windows 会锁 `win-unpacked` 里的 exe；Linux 锁 `linux-unpacked`）
 - 脚本只动**被 gitignore 的编译产物**：`release/*-unpacked`、`dist/`、`web_dist/`、`build/install-stamp.json`
 - **永远不碰** `HERMES_HOME` 里的数据（`sessions/`、`skills/`、`config.yaml`、`memories/`）

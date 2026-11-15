@@ -399,6 +399,9 @@ if ! locate_payload; then
   exit 1
 fi
 ok "找到产物 $ART_NAME（$((ART_SIZE/1024/1024)) MB，通道=$PAYLOAD_KIND）"
+  local vpx=(); [ -n "$PX" ] && vpx=(-x "$PX")
+  ver=$(curl -fsSL ${vpx[@]+"${vpx[@]}"} --max-time 20 "https://github.com/$BUILDER_REPO/releases/download/prebuild/latest.json" 2>/dev/null         | jq -r --arg s "$T_SHA" 'select(.sha==$s) | .version // empty' 2>/dev/null)
+  [ -n "${ver:-}" ] && ok "对应版本：$ver"
 
 download
 verify || { warn '产物校验不过 → 不覆盖，保持现状（下次 hermes update 会本地全量编译）'; exit 1; }
