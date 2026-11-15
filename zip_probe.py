@@ -8,10 +8,15 @@ import json, struct, subprocess, sys, zlib
 def sh(args):
     return subprocess.run(args, capture_output=True).stdout
 
-def api(path, token):
-    out = sh(["curl", "-fsSL", "-H", f"Authorization: token {token}",
-              "-H", "Accept: application/vnd.github+json", f"https://api.github.com/{path}"])
-    return json.loads(out)
+def api(path, token, tries=5):
+    import time
+    for i in range(tries):
+        out = sh(["curl", "-fsSL", "--retry", "2", "-H", f"Authorization: token {token}",
+                  "-H", "Accept: application/vnd.github+json", f"https://api.github.com/{path}"])
+        if out:
+            return json.loads(out)
+        time.sleep(3)
+    sys.exit("api 请求连续失败（网络）")
 
 def rng(url, token, a, b):
     out = sh(["curl", "-fsSL", "-H", f"Authorization: token {token}",
@@ -23,7 +28,9 @@ def main():
     want = sys.argv[3:]
     token = sh(["gh", "auth", "token"]).decode().strip()
     arts = api(f"repos/{repo}/actions/artifacts?per_page=100", token)["artifacts"]
-    art = next((a for a in arts if a["name"] == name and not a["expired"]), None)
+    cands = sorted((a for a in arts if a["name"] == name and not a["expired"]),
+                   key=lambda a: (a.get("created_at") or "", a["id"]), reverse=True)
+    art = cands[0] if cands else None
     if not art:
         sys.exit(f"找不到 artifact {name}")
     url = art["archive_download_url"]
@@ -34,7 +41,7 @@ def main():
             size = int(line.split(":")[1].strip())
     if not size:
         sys.exit("拿不到 Content-Length")
-    print(f"{name}: {size/1048576:.1f} MB (zip)")
+    print(f"{name}: {size/1048576:.1f} MB (zip)  id={art['id']}  created={art.get('created_at','?')}")
 
     tail_n = min(size, 65536)
     tail = rng(url, token, size - tail_n, size - 1)

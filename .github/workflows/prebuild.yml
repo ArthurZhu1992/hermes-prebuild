@@ -83,6 +83,17 @@ jobs:
           path: src
           fetch-depth: 1
 
+      - name: 让 stamp 认得出渠道（分支名）
+        shell: bash
+        working-directory: .
+        run: |
+          if [[ "$REF" =~ ^v?[0-9]+\.[0-9]+ ]] || [[ "$REF" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "detached at $REF（tag / commit）→ stamp.branch = null，与目标机 detached 状态一致"
+          else
+            git -C src checkout -q -B "$REF"
+            echo "attached: $(git -C src rev-parse --abbrev-ref HEAD) → stamp.branch = $REF"
+          fi
+
       - uses: actions/setup-python@v5
         with: { python-version: '3.14' }
 
@@ -164,6 +175,17 @@ jobs:
           ref: ${{ needs.resolve.outputs.sha }}
           path: src
           fetch-depth: 1
+
+      - name: 让 stamp 认得出渠道（分支名）
+        shell: bash
+        working-directory: .
+        run: |
+          if [[ "$REF" =~ ^v?[0-9]+\.[0-9]+ ]] || [[ "$REF" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "detached at $REF（tag / commit）→ stamp.branch = null，与目标机 detached 状态一致"
+          else
+            git -C src checkout -q -B "$REF"
+            echo "attached: $(git -C src rev-parse --abbrev-ref HEAD) → stamp.branch = $REF"
+          fi
 
       - name: 系统库（electron-builder 打包需要）
         run: |
