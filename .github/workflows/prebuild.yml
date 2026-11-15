@@ -29,7 +29,7 @@ on:
 
 permissions:
   contents: write        # state/last-built.json 的提交
-  actions: read
+  actions: write         # 删旧 artifact 需要 write（只读会 403，被 set +e 吞掉）
 
 concurrency:
   group: prebuild-${{ github.ref }}
