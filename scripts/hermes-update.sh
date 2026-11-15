@@ -170,14 +170,11 @@ init_api() {
   TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
   if command -v gh >/dev/null 2>&1; then
     API_MODE=gh
-    if [ -z "$TOKEN" ]; then
-      gh auth status >/dev/null 2>&1 || die 'gh 未登录：gh auth login（或 export GITHUB_TOKEN）'
-      TOKEN=$(gh auth token)
-    fi
+    [ -n "$TOKEN" ] || { gh auth status >/dev/null 2>&1 && TOKEN=$(gh auth token); }
   else
     API_MODE=curl
-    command -v jq >/dev/null 2>&1 || die '没有 gh 也没有 jq；先装其中任一个'
-    [ -n "$TOKEN" ] || die '这台没有 gh：请 export GITHUB_TOKEN=<PAT>（只需 repo 读权限）'
+    command -v jq >/dev/null 2>&1 || die '这台没有 gh 也没有 jq；装其中任一个即可'
+    # 无 token 也能读公开仓库（匿名 60 次/小时），release 通道全程不需要认证
   fi
 }
 
@@ -187,10 +184,10 @@ api_get() {
   if [ "$API_MODE" = gh ]; then
     gh api "$path" --jq "$jqf"
   else
-    local px=(); [ -n "$PX" ] && px=(-x "$PX")
-    curl -fsSL ${px[@]+"${px[@]}"} -H "Authorization: token $TOKEN" \
-         -H 'Accept: application/vnd.github+json' -H 'User-Agent: hermes-prebuild' \
-         --retry 2 --connect-timeout 20 "https://api.github.com/$path" | jq -r "$jqf"
+    local px=() auth=()
+    [ -n "$PX" ] && px=(-x "$PX")
+    [ -n "$TOKEN" ] && auth=(-H "Authorization: token $TOKEN")
+    curl -fsSL ${px[@]+"${px[@]}"} ${auth[@]+"${auth[@]}"}          -H 'Accept: application/vnd.github+json' -H 'User-Agent: hermes-prebuild'          --retry 2 --connect-timeout 20 "https://api.github.com/$path" | jq -r "$jqf"
   fi
 }
 
@@ -232,7 +229,7 @@ locate_payload() {
   case "$SOURCE" in
     artifact) find_artifact ;;
     release)  find_release_asset ;;
-    *)        find_artifact || find_release_asset ;;
+    *)        find_release_asset || find_artifact ;;
   esac
 }
 
@@ -246,6 +243,7 @@ download() {
          -o "$TMP/payload.zip" "$ART_URL" \
          || die 'release 资产下载失败（国内直连常 0 B/s，加 --proxy 再试）'
   else
+    [ -n "$TOKEN" ] || die 'artifact 通道需要 GitHub token；改用 --source release（匿名可下）'
     curl -fsSL ${px[@]+"${px[@]}"} -H "Authorization: token $TOKEN" -H "Accept: application/zip" \
          --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 \
          -o "$TMP/payload.zip" "https://api.github.com/repos/$BUILDER_REPO/actions/artifacts/$ART_ID/zip" \

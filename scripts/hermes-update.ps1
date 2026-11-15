@@ -187,15 +187,12 @@ function Get-Token {
     $t = & gh auth token 2>$null
     if ($t) { return ("$t").Trim() }
   }
-  Fail '没有可用 GitHub token：装 gh 并 gh auth login，或设置 GITHUB_TOKEN 环境变量（需 repo 读权限）'
+  return ''      # 没有也能用：release 通道匿名可下，公开 API 匿名 60 次/小时
 }
 
 function Api-Get([string]$path) {
-  $h = @{
-    Authorization = "token $script:Token"
-    Accept        = 'application/vnd.github+json'
-    'User-Agent'  = 'hermes-prebuild'
-  }
+  $h = @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'hermes-prebuild' }
+  if ($script:Token) { $h['Authorization'] = "token $($script:Token)" }
   Invoke-RestMethod -Uri "https://api.github.com/$path" -Headers $h -TimeoutSec 90 -ErrorAction Stop
 }
 
@@ -238,8 +235,8 @@ function Locate-Payload($i, $short) {
     'artifact' { Find-Artifact $i $short }
     'release'  { Find-ReleaseAsset $i $short }
     default {
-      $a = Find-Artifact $i $short
-      if (-not $a) { $a = Find-ReleaseAsset $i $short }
+      $a = Find-ReleaseAsset $i $short
+      if (-not $a) { $a = Find-Artifact $i $short }
       $a
     }
   }
