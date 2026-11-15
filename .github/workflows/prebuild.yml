@@ -103,6 +103,14 @@ jobs:
 
       - name: 构建（与 hermes update 同一套函数）
         working-directory: src
+        # GITHUB_SHA/GITHUB_REF_NAME 必须清空：write-build-stamp.mjs 的 fromCI() 会把
+        # 「本仓库（builder）的提交」当成她的提交烘进 stamp，导致 source=ci / commit=错的 SHA，
+        # 目标机上 stampDrift 与本地构建不一致 → 复用判定永远失败。清空后走 fromLocalGit()，
+        # 与目标机本地构建逐字段一致（source=local, branch=main 或 detached→null）。
+        env:
+          GITHUB_SHA: ''
+          GITHUB_REF_NAME: ''
+          GITHUB_HEAD_REF: ''
         run: |
           .venv\Scripts\python.exe -c "from pathlib import Path; from hermes_cli.source_build import build_update_products; build_update_products(Path('.').resolve(), desktop=True)"
 
@@ -183,6 +191,11 @@ jobs:
 
       - name: 构建
         working-directory: src
+        # 同 build-win：清空 GITHUB_SHA 等，避免 fromCI() 把 builder 仓库的提交烘进 stamp
+        env:
+          GITHUB_SHA: ''
+          GITHUB_REF_NAME: ''
+          GITHUB_HEAD_REF: ''
         run: |
           .venv/bin/python -c "from pathlib import Path; from hermes_cli.source_build import build_update_products; build_update_products(Path('.').resolve(), desktop=True)"
 
