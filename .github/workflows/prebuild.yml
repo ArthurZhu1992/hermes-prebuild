@@ -1,0 +1,268 @@
+name: Hermes prebuild
+
+# 只做一件事：把上游 NousResearch/hermes-agent 在某个 ref 上编译一遍，
+# 产出"已编译目录树"的 zip artifact，供各机器覆盖后让 hermes update 跳过本地编译。
+#
+# 产物（artifact 名 = hermes-<os>-<arch>-<sha12>）：
+#   hermes-win-x64-<sha12>      win-unpacked + apps/desktop/dist + build/install-stamp.json + web_dist + ui-tui/dist
+#   hermes-linux-x64-<sha12>    同上，linux-unpacked
+#   hermes-cli-linux-<sha12>    只含 web_dist + ui-tui/dist（纯 CLI 机器用，~8 MB）
+#   每个 artifact 内都有 manifest.json（ref/sha/platform/arch/node/built_at）
+#
+# 触发：
+#   schedule  每天 03:17 UTC 检查一次上游 main，变了才构建（没变 10 秒早退）
+#   dispatch  手动指定任意 ref（分支/tag/SHA），用于 stable 发版后出包
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "upstream ref (branch / tag / commit sha)"
+        required: false
+        default: main
+      force:
+        description: "ignore the last-built state and build anyway"
+        type: boolean
+        default: false
+  schedule:
+    - cron: '17 3 * * *'
+
+permissions:
+  contents: write        # state/last-built.json 的提交
+  actions: read
+
+concurrency:
+  group: prebuild-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.r.outputs.sha }}
+      short: ${{ steps.r.outputs.short }}
+      changed: ${{ steps.r.outputs.changed }}
+      ref: ${{ steps.r.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v4          # 本仓库，为了读 state/
+      - id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.ref || 'main' }}
+          FORCE: ${{ inputs.force || 'false' }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/NousResearch/hermes-agent/commits/$REF" --jq .sha)
+          short=${sha:0:12}
+          last=$(jq -r --arg ref "$REF" '.[$ref].sha // "none"' state/last-built.json 2>/dev/null || echo none)
+          changed=true
+          if [ "$sha" = "$last" ] && [ "$FORCE" != "true" ]; then changed=false; fi
+          echo "sha=$sha"     >> "$GITHUB_OUTPUT"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF"     >> "$GITHUB_OUTPUT"
+          echo "ref=$REF sha=$sha last=$last changed=$changed"
+
+  # ── Windows 桌面壳 ────────────────────────────────────────────────────────
+  build-win:
+    needs: resolve
+    if: needs.resolve.outputs.changed == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      REF: ${{ needs.resolve.outputs.ref }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+      SHORT: ${{ needs.resolve.outputs.short }}
+      PYTHONUTF8: '1'
+    steps:
+      - name: 取上游源码
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: src
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.14' }
+
+      - name: uv
+        run: |
+          irm https://astral.sh/uv/install.ps1 | iex
+          echo "$env:USERPROFILE\.local\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Python 依赖
+        working-directory: src
+        run: |
+          uv venv .venv --python 3.14
+          uv pip install -e .
+
+      - name: PM 工具链（node 26.12.1 / pnpm 12.15.0，按 pm/lock.json 校验 sha256）
+        working-directory: src
+        run: .venv\Scripts\python.exe -m pm.cli install --tools-only
+
+      - name: 构建（与 hermes update 同一套函数）
+        working-directory: src
+        run: |
+          .venv\Scripts\python.exe -c "from pathlib import Path; from hermes_cli.source_build import build_update_products; build_update_products(Path('.').resolve(), desktop=True)"
+
+      - name: 写 manifest
+        working-directory: src
+        shell: pwsh
+        run: |
+          $node = (Get-Content pm/lock.json -Raw | ConvertFrom-Json).packages.node.version
+          $m = [ordered]@{
+            ref = $env:REF; sha = $env:SHA; platform = 'win32'; arch = 'x64'
+            node = $node; built_at = (Get-Date).ToUniversalTime().ToString('o')
+            workflow_run = $env:GITHUB_RUN_ID
+          }
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          $m | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 out/manifest.json
+          Get-ChildItem out | Select-Object Name,Length | Format-Table
+
+      - name: 收集产物
+        shell: pwsh
+        run: |
+          $dst = 'payload'
+          New-Item -ItemType Directory -Force -Path $dst/apps/desktop/release,$dst/apps/desktop/build,$dst/apps/desktop/dist,$dst/hermes_cli/web_dist,$dst/ui-tui/dist | Out-Null
+          Copy-Item src/apps/desktop/release/win-unpacked -Destination $dst/apps/desktop/release -Recurse
+          Copy-Item src/apps/desktop/build/install-stamp.json -Destination $dst/apps/desktop/build
+          Copy-Item src/apps/desktop/dist/* -Destination $dst/apps/desktop/dist -Recurse
+          Copy-Item src/hermes_cli/web_dist/* -Destination $dst/hermes_cli/web_dist -Recurse
+          Copy-Item src/ui-tui/dist/* -Destination $dst/ui-tui/dist -Recurse
+          Copy-Item src/out/manifest.json -Destination $dst
+          "win payload: " + [math]::Round((Get-ChildItem $dst -Recurse | Measure-Object Length -Sum).Sum/1MB) + " MB"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermes-win-x64-${{ needs.resolve.outputs.short }}
+          path: payload
+          retention-days: 7
+          compression-level: 6
+
+  # ── Linux 桌面壳 + CLI 轻包 ───────────────────────────────────────────────
+  build-linux:
+    needs: resolve
+    if: needs.resolve.outputs.changed == 'true'
+    runs-on: ubuntu-24.04          # 目标机 24.04 / 26.04 都能跑；不要用更新的镜像当构建机
+    timeout-minutes: 90
+    env:
+      REF: ${{ needs.resolve.outputs.ref }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+      SHORT: ${{ needs.resolve.outputs.short }}
+    steps:
+      - name: 取上游源码
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: src
+          fetch-depth: 1
+
+      - name: 系统库（electron-builder 打包需要）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libnss3 libgtk-3-0t64 libasound2t64 libgbm1 xvfb || \
+          sudo apt-get install -y -qq libnss3 libgtk-3-0 libasound2 libgbm1 xvfb
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.14' }
+
+      - name: uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh && echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Python 依赖
+        working-directory: src
+        run: |
+          uv venv .venv --python 3.14
+          uv pip install -e .
+
+      - name: PM 工具链
+        working-directory: src
+        run: .venv/bin/python -m pm.cli install --tools-only
+
+      - name: 构建
+        working-directory: src
+        run: |
+          .venv/bin/python -c "from pathlib import Path; from hermes_cli.source_build import build_update_products; build_update_products(Path('.').resolve(), desktop=True)"
+
+      - name: 写 manifest + 收集产物
+        working-directory: src
+        run: |
+          set -euo pipefail
+          node=$(python -c "import json;print(json.load(open('pm/lock.json'))['packages']['node']['version'])")
+          mkdir -p out
+          python - "$node" <<'PY'
+          import json,os,sys,datetime
+          json.dump({"ref":os.environ["REF"],"sha":os.environ["SHA"],"platform":"linux","arch":"x64",
+                     "node":sys.argv[1],"built_at":datetime.datetime.now(datetime.UTC).isoformat(),
+                     "workflow_run":os.environ["GITHUB_RUN_ID"]}, open("out/manifest.json","w"), indent=2)
+          PY
+          mkdir -p ../payload-full/apps/desktop/release ../payload-full/apps/desktop/build ../payload-full/apps/desktop/dist ../payload-full/hermes_cli/web_dist ../payload-full/ui-tui/dist
+          cp -a apps/desktop/release/linux-unpacked ../payload-full/apps/desktop/release/
+          cp -a apps/desktop/build/install-stamp.json ../payload-full/apps/desktop/build/
+          cp -a apps/desktop/dist/. ../payload-full/apps/desktop/dist/
+          cp -a hermes_cli/web_dist/. ../payload-full/hermes_cli/web_dist/
+          cp -a ui-tui/dist/. ../payload-full/ui-tui/dist/
+          cp out/manifest.json ../payload-full/
+          # 轻包：只给纯 CLI 机器（无 Electron）
+          mkdir -p ../payload-cli/hermes_cli/web_dist ../payload-cli/ui-tui/dist
+          cp -a hermes_cli/web_dist/. ../payload-cli/hermes_cli/web_dist/
+          cp -a ui-tui/dist/. ../payload-cli/ui-tui/dist/
+          cp out/manifest.json ../payload-cli/
+          du -sh ../payload-full ../payload-cli
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermes-linux-x64-${{ needs.resolve.outputs.short }}
+          path: payload-full
+          retention-days: 7
+          compression-level: 6
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermes-cli-linux-${{ needs.resolve.outputs.short }}
+          path: payload-cli
+          retention-days: 7
+          compression-level: 9
+
+  # ── 记录状态（同时解决 public 仓库 60 天无活动被禁用定时任务的问题）────────
+  state:
+    needs: [resolve, build-win, build-linux]
+    if: always() && needs.resolve.outputs.changed == 'true' && needs.build-win.result == 'success' && needs.build-linux.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          REF: ${{ needs.resolve.outputs.ref }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          SHORT: ${{ needs.resolve.outputs.short }}
+        run: |
+          mkdir -p state
+          python - <<'PY'
+          import json,os,datetime,pathlib
+          p = pathlib.Path('state/last-built.json')
+          d = json.loads(p.read_text()) if p.exists() else {}
+          d[os.environ['REF']] = {"sha": os.environ['SHA'], "short": os.environ['SHORT'],
+                                  "built_at": datetime.datetime.now(datetime.UTC).isoformat()}
+          p.write_text(json.dumps(d, indent=2, ensure_ascii=False) + "\n")
+          PY
+          git config user.name  "hermes-prebuild"
+          git config user.email "hermes-prebuild@users.noreply.github.com"
+          git add state/last-built.json
+          git commit -m "state: $REF @ $SHORT" || echo "nothing to commit"
+          git push
+
+      - name: 清理旧 artifact（只留当前这个 SHA 的三份）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          gh api "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | "\(.id)|\(.name)"' | while IFS='|' read -r id name; do
+              case "$name" in
+                hermes-*"$SHORT"|hermes-*"$SHORT"-*) continue ;;   # 保留本次的
+                hermes-*) gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" \
+                            && echo "deleted $name ($id)" ;;
+              esac
+            done

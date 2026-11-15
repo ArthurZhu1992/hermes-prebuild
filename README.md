@@ -1,0 +1,181 @@
+# hermes-prebuild
+
+给 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) **预编译**的构建器仓库。
+本仓库不含任何上游代码——它只在 GitHub Actions 里 checkout 上游的某个 ref，编一遍，把**编译产物**打成交付包。
+
+目的只有一个：让各机器上的 `hermes update` 不再本地跑 `electron-builder` / `vite` / `pnpm install`，
+改成「下载已经编好的目录树 → 覆盖 → update 命中 receipt 直接跳过编译」。
+
+> 这是**产物覆盖**方案，不是安装包。产物不是 `.deb` / `.AppImage` / `.MSIX`，
+> 而是与 git 源码安装对位的已编译目录（`*-unpacked/`、`dist/`、receipts、烘焙 stamp）。
+
+---
+
+## 1. 产物
+
+每次构建按 ref 产三种 artifact（名字 = `hermes-<os>-<arch>-<sha12>`，保留 7 天）：
+
+| artifact | 内容 | zip 后 |
+|---|---|---|
+| `hermes-win-x64-<sha12>` | `apps/desktop/release/win-unpacked`、`apps/desktop/dist`、`apps/desktop/build/install-stamp.json`、`hermes_cli/web_dist`、`ui-tui/dist` | ~150 MB |
+| `hermes-linux-x64-<sha12>` | 同上，`linux-unpacked` | ~150 MB |
+| `hermes-cli-linux-<sha12>` | 只有 `hermes_cli/web_dist` + `ui-tui/dist`（纯 CLI 机器，无 Electron） | ~8 MB |
+
+每个 artifact 根目录有 `manifest.json`：
+
+```json
+{ "ref": "v0.23.1", "sha": "3b4215785882...", "platform": "linux",
+  "arch": "x64", "node": "26.12.1", "built_at": "...", "workflow_run": "..." }
+```
+
+## 2. 触发
+
+| 方式 | 说明 |
+|---|---|
+| `schedule`（每天 03:17 UTC） | 检查上游 `main`；SHA 没变就 10 秒早退，不浪费 runner |
+| `workflow_dispatch` | 手动指定任意 `ref`（分支 / tag / SHA），stable 发版后出包用这个 |
+
+```bash
+# stable 发新版后给 Linux 桌面端出包
+gh workflow run prebuild.yml -R ArthurZhu1992/hermes-prebuild -f ref=v0.23.1
+
+# 强制重编（忽略 last-built 状态）
+gh workflow run prebuild.yml -R ArthurZhu1992/hermes-prebuild -f ref=main -f force=true
+```
+
+构建用的是 `hermes update` 自己那套函数（`hermes_cli.source_build.build_update_products`），
+所以产出的 `hermes-build.json` receipt 与目标机同 SHA 时逐字段一致（`platform`/`arch`/`node`）。
+Node 版本固定 `26.12.1`（取自 `pm/lock.json`），这是 receipt 校验的一部分。
+
+## 3. 用脚本升级（推荐）
+
+两个脚本做同一件事，只在平台实现上不同：
+
+| 平台 | 脚本 |
+|---|---|
+| Windows | `scripts/hermes-update.ps1` |
+| Linux | `scripts/hermes-update.sh` |
+
+下载后：
+
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -File .\hermes-update.ps1
+```
+```bash
+# Linux
+chmod +x hermes-update.sh && ./hermes-update.sh
+```
+
+脚本依次做：
+
+1. **探测**：`HERMES_HOME`、安装目录、版本、commit、渠道（main/stable）、
+   `payload`/`updateMechanism`、有没有桌面壳、`pm/lock.json` 的 Node pin、磁盘余量
+2. **选目标**：渠道 `stable` → 最新正式 tag；`main` → 上游 HEAD；或 `--ref` 指定
+3. **找产物**：按 `hermes-<os>-<arch>-<sha12>` 匹配，没有桌面壳就用 `hermes-cli-*` 轻包
+4. **校验**：`manifest.sha` / `platform` / `arch` / `node`、烘焙 stamp 的 `commit`、三个 receipt 是否存在
+5. **备份 → 覆盖 → 可选跑 `hermes update`**：备份在 `<安装目录>/.hermes-prebuild-backup-<时间戳>/`
+
+### 交互菜单
+
+不带参数运行会先打印安装状态，然后给菜单：
+
+```
+  1) 只检查：本机版本 vs 目标版本，看有没有对应产物
+  2) 下载并覆盖产物（不跑 hermes update）
+  3) 下载覆盖 + 运行 hermes update（推荐）
+  4) 选一个具体 tag/SHA 再执行
+  5) 回滚到上一次备份
+  0) 退出
+```
+
+### 非交互 / 自动化
+
+```bash
+./hermes-update.sh --diagnose            # 只打印状态
+./hermes-update.sh --dry-run             # 走完所有检查，不落地
+./hermes-update.sh --ref v0.23.1 --yes   # 直接干到 v0.23.1
+./hermes-update.sh --skip-update --yes   # 只覆盖，不更新
+./hermes-update.sh --rollback            # 回滚上一次覆盖
+```
+
+```powershell
+.\hermes-update.ps1 -Diagnose
+.\hermes-update.ps1 -DryRun
+.\hermes-update.ps1 -Ref v0.23.1 -Yes
+.\hermes-update.ps1 -Rollback
+```
+
+### 没装 gh 也能用
+
+脚本优先用 `gh`；没有 `gh` 时自动退化到 `curl` + `jq` + `GITHUB_TOKEN`：
+
+```bash
+export GITHUB_TOKEN=ghp_xxx      # 只需 repo 读权限（公开仓库其实用无权限 token 也行）
+./hermes-update.sh
+```
+
+Windows 侧同理：`$env:GITHUB_TOKEN = 'ghp_xxx'`，或装 gh 后 `gh auth login` 一次即可。
+
+环境变量可覆盖仓库名：`BUILDER_REPO`（bash）/ 参数 `-BuilderRepo`（PS）。
+
+### 代理（下载 artifact 与 `gh api` 都要用）
+
+优先级：**命令行 `--proxy` > 环境变量 > 系统代理 > 直连**。
+
+| 平台 | 自动读取的系统代理 |
+|---|---|
+| Windows | 注册表 `HKCU\...\Internet Settings` 的 `ProxyEnable`/`ProxyServer`（支持 `http=host:port;https=host:port` 写法），以及 `HTTPS_PROXY`/`ALL_PROXY`/`HTTP_PROXY` |
+| Linux | `HTTPS_PROXY`/`ALL_PROXY`/`HTTP_PROXY`；GNOME 桌面读 `gsettings get org.gnome.system.proxy mode` == `manual` 时的 host/port（含 socks） |
+
+```bash
+./hermes-update.sh --proxy 127.0.0.1:7890         # 只写 ip:端口时默认按 http://
+./hermes-update.sh --proxy socks5://10.0.0.2:1080
+./hermes-update.sh --no-proxy                     # 无视系统代理，强制直连
+```
+```powershell
+.\hermes-update.ps1 -Proxy 127.0.0.1:7890
+.\hermes-update.ps1 -NoProxy
+```
+
+行为细节：
+
+- 解析到代理后**先实测**（`curl -x <proxy> https://api.github.com/` 必须 200 才算通）
+- 不通时：交互模式问你要不要改直连；`--yes` 直接报错退出；`--diagnose` 只警告并按直连继续
+- 交互菜单里有 `6) 手动指定代理`，可现场输入 `ip:端口`
+- 代理只作用于**本脚本的下载与 API 调用**（`curl` + `gh`）；`hermes update` 自己的 git/uv/pnpm 走它自己的镜像与 git 配置，不受影响
+
+## 4. 覆盖之后会发生什么
+
+`hermes update` 的三个判定会被满足，于是编译被跳过：
+
+- `ui-tui/dist/hermes-build.json` 与 `hermes_cli/web_dist/hermes-build.json` 的输入树 hash + Node 版本一致 → 打印 `✓ TUI is up to date`，不跑 tsc/vite
+- `release/*-unpacked/resources/install-stamp.json` 的 `commit` == 本地 HEAD 且输入一致 → 不跑 electron-builder（最贵的一段）
+- `pyproject.toml` / `uv.lock` / `pnpm-lock.yaml` 没变的更新里，依赖段本来就快
+
+**任何一条校验不通过，脚本什么都不改**，`hermes update` 就退回原来的本地全量编译——最差等于没用过这个仓库。
+
+## 5. 前置条件与边界
+
+- 目标机需要 `gh` 且 `gh auth login` 过（脚本用 `gh auth token` 拉 artifact）
+- 覆盖前必须退出桌面应用（Windows 会锁 `win-unpacked` 里的 exe；Linux 锁 `linux-unpacked`）
+- 脚本只动**被 gitignore 的编译产物**：`release/*-unpacked`、`dist/`、`web_dist/`、`build/install-stamp.json`
+- **永远不碰** `HERMES_HOME` 里的数据（`sessions/`、`skills/`、`config.yaml`、`memories/`）
+- 覆盖的只是编译输出；代码仍然由 `hermes update` 的 `git fetch/pull` 更新
+- 不要手改 `install-stamp.json`：在 bundle 形态下运行中的 app 会比对启动 stamp，改错会反复重启
+
+## 6. 已知坑
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| 找不到产物 | CI 没编这个 SHA（手动 `gh workflow run`），或已超过 7 天保留期 |
+| `manifest.node != 本机` | 本机 `pm/lock.json` 的 Node pin 与构建机不同 → 换对应 SHA 的产物，或本地编译 |
+| 覆盖后 update 仍全量编译 | 目标 SHA 与本地产物不一致；看日志里 `Desktop app build owed:` 后面的原因 |
+| Windows 覆盖失败 | Hermes 桌面还在跑；退出后重跑（脚本会检测并直接报错） |
+| Linux 产物起不来 | 构建镜像（ubuntu-24.04）比目标机新太多；本仓库固定用 24.04，26.04 目标机可运行 |
+
+## 7. Linux 用哪个 bundle
+
+`linux-unpacked` 的 Electron 二进制依赖 glibc。构建机固定 `ubuntu-24.04`：
+24.04 打出的产物在 24.04 / 26.04 上都能跑（新 glibc 跑旧二进制没问题），反过来不行。
+所以**不要**把 `runs-on` 改成比目标机更新的镜像。

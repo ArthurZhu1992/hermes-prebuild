@@ -1,0 +1,447 @@
+﻿<#
+.SYNOPSIS
+  Hermes Windows 预编译产物同步器 —— 探测本机安装、挑要升级的版本、把 CI 编好的产物覆盖进去。
+
+.DESCRIPTION
+  配合 hermes-prebuild 仓库的 prebuild.yml 使用。它做四件事：
+    1) 探测：HERMES_HOME、安装目录、版本、渠道、有没有桌面壳、Node 版本、磁盘余量
+    2) 选版本：按渠道取目标 SHA（stable=最新 tag，main=上游 HEAD），或 -Ref 直接指定
+    3) 下载校验：拉对应 artifact，校验 manifest / 烘焙 stamp / receipt 的 commit+platform+arch+node
+    4) 覆盖并升级：备份旧产物 → 覆盖 → 运行 hermes update（--SkipUpdate 可跳过）
+
+  校验不过就什么都不改；覆盖失败可从备份回滚。它永远不碰 HERMES_HOME 里的数据
+  （sessions/skills/config），只动 hermes-agent 下被 gitignore 的编译产物。
+
+.EXAMPLE
+  .\hermes-update.ps1                    # 交互菜单
+  .\hermes-update.ps1 -Diagnose          # 只看状态，不改任何东西
+  .\hermes-update.ps1 -Ref v0.23.1 -Yes  # 非交互：直接干到 v0.23.1
+  .\hermes-update.ps1 -DryRun            # 走完全部检查，不落地
+  .\hermes-update.ps1 -Rollback          # 回到上一次覆盖前的备份
+#>
+[CmdletBinding()]
+param(
+  [string]$Ref,
+  [switch]$Diagnose,
+  [switch]$DryRun,
+  [switch]$Yes,
+  [switch]$SkipUpdate,
+  [switch]$Rollback,
+  [string]$Proxy,                        # 例：http://127.0.0.1:7890 / socks5://10.0.0.2:1080
+  [switch]$NoProxy,                      # 忽略系统代理，强制直连
+  [string]$BuilderRepo = 'ArthurZhu1992/hermes-prebuild',
+  [string]$Upstream    = 'NousResearch/hermes-agent'
+)
+
+$ErrorActionPreference = 'Stop'
+try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new() } catch {}   # 中文输出别乱码
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+$script:StampTs = Get-Date -Format 'yyyyMMdd-HHmmss'
+$Arch = if ([Environment]::Is64BitOperatingSystem) {
+  if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+} else { 'x86' }
+
+function Say($m, $c = 'Gray') { Write-Host $m -ForegroundColor $c }
+function Ok($m)  { Write-Host "  OK   $m" -ForegroundColor Green }
+function Warn($m){ Write-Host "  !!   $m" -ForegroundColor Yellow }
+function Fail($m){ Write-Host "  XX   $m" -ForegroundColor Red; throw $m }
+
+# ─── 0. 代理 ────────────────────────────────────────────────────────────────
+function Get-SystemProxy {
+  # 1) 环境变量优先（HTTPS_PROXY / ALL_PROXY / HTTP_PROXY，大小写都看）
+  foreach ($n in @('HTTPS_PROXY','https_proxy','ALL_PROXY','all_proxy','HTTP_PROXY','http_proxy')) {
+    $v = [Environment]::GetEnvironmentVariable($n)
+    if ($v) { return @{ Url = $v; Source = "环境变量 $n" } }
+  }
+  # 2) Windows 系统代理（设置 → 网络 → 代理）
+  $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+  try {
+    $p = Get-ItemProperty -Path $key -ErrorAction Stop
+    if ([int]$p.ProxyEnable -eq 1 -and $p.ProxyServer) {
+      $raw = [string]$p.ProxyServer
+      $url = $null
+      if ($raw -match '(?i)(?:^|;)\s*(?:https?|socks)=([^;]+)') { $url = $Matches[1] }
+      elseif ($raw -notmatch '=') { $url = $raw }
+      if ($url) {
+        if ($url -notmatch '^[a-z0-9]+://') { $url = "http://$url" }
+        return @{ Url = $url; Source = '系统代理(注册表)' }
+      }
+    }
+  } catch {}
+  @{ Url = $null; Source = '无（直连）' }
+}
+
+function Resolve-Proxy {
+  if ($NoProxy) { return @{ Url = $null; Source = '已禁用(--NoProxy)' } }
+  if ($Proxy) {
+    $u = $Proxy
+    if ($u -notmatch '^[a-z0-9]+://') { $u = "http://$u" }     # 只输 ip:端口 时默认 http
+    return @{ Url = $u; Source = '命令行 --Proxy' }
+  }
+  Get-SystemProxy
+}
+
+function Set-ProxyEnv($url) {
+  if (-not $url) {
+    foreach ($n in @('HTTPS_PROXY','HTTP_PROXY','ALL_PROXY','https_proxy','http_proxy','all_proxy')) {
+      [Environment]::SetEnvironmentVariable($n, $null)
+    }
+    return
+  }
+  foreach ($n in @('HTTPS_PROXY','HTTP_PROXY','ALL_PROXY')) { [Environment]::SetEnvironmentVariable($n, $url) }
+  $env:NO_PROXY = 'localhost,127.0.0.1,::1'
+}
+
+function Test-Proxy($url) {
+  if (-not $url) { return $true }
+  Say "  探测代理 $url ..." 'Gray'
+  $errFile = [IO.Path]::GetTempFileName()
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'      # 原生程序写 stderr 时别被 Stop 当成终止错误
+  try {
+    $code = & curl.exe -sS -o NUL -w '%{http_code}' -x $url --connect-timeout 10 --max-time 20 https://api.github.com/ 2>$errFile
+  } finally {
+    $ErrorActionPreference = $prevEap
+    if (Test-Path $errFile) { Remove-Item $errFile -Force -ErrorAction SilentlyContinue }
+  }
+  if ("$code" -eq '200') { Ok '代理可用（api.github.com → 200）'; return $true }
+  Warn "代理没通（返回 '$code'）：可以用 -Proxy 换一个，或 -NoProxy 强制直连"
+  return $false
+}
+
+# ─── 1. 探测 ────────────────────────────────────────────────────────────────
+function Get-HermesInstall {
+  $home_ = if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $env:LOCALAPPDATA 'hermes' }
+  $dir   = Join-Path $home_ 'hermes-agent'
+  $info = [ordered]@{
+    Home        = $home_
+    Dir         = $dir
+    Exists      = (Test-Path $dir)
+    Version     = 'unknown'
+    Commit      = 'unknown'
+    Channel     = 'unknown'
+    Payload     = 'unknown'
+    UpdateMech  = 'unknown'
+    Desktop     = $false
+    DesktopExe  = $null
+    NodePin     = 'unknown'
+    Cli         = (Get-Command hermes -ErrorAction SilentlyContinue).Source
+  }
+  if (-not $info.Exists) { return [pscustomobject]$info }
+
+  $stamp = Join-Path $dir 'install-stamp.json'
+  if (Test-Path $stamp) {
+    $s = Get-Content $stamp -Raw | ConvertFrom-Json
+    $info.Version    = $s.displayVersion
+    $info.Commit     = $s.commit
+    $info.Payload    = $s.payload
+    $info.UpdateMech = $s.updateMechanism
+    if ($s.branch) { $info.Channel = $s.branch }
+    # 没记录渠道时按 stamp 推：distance=0 说明正好停在某个 release tag 上（stable），
+    # 否则是在 tag 之后的 commit 上（main）。config.yaml 里的记录优先。
+    if ($info.Channel -eq 'unknown' -and $null -ne $s.distance) {
+      $info.Channel = if ([int]$s.distance -eq 0) { 'stable' } else { 'main' }
+    }
+  } else {
+    $info.Payload = 'legacy'
+  }
+  $cfg = Join-Path $home_ 'config.yaml'
+  if (Test-Path $cfg) {
+    $m = Select-String -Path $cfg -Pattern '^\s+channel:\s*(\S+)' | Select-Object -First 1
+    if ($m) { $info.Channel = $m.Matches[0].Groups[1].Value.Trim('"',"'") }
+  }
+  $lock = Join-Path $dir 'pm/lock.json'
+  if (Test-Path $lock) {
+    try { $info.NodePin = (Get-Content $lock -Raw | ConvertFrom-Json).packages.node.version } catch {}
+  }
+  $exe = Join-Path $dir 'apps/desktop/release/win-unpacked/Hermes.exe'
+  if (Test-Path $exe) { $info.Desktop = $true; $info.DesktopExe = $exe }
+  [pscustomobject]$info
+}
+
+function Show-Install($i) {
+  Say ''
+  Say '── 本机 Hermes 安装 ─────────────────────────────────────────────' 'Cyan'
+  Say ("  HERMES_HOME : {0}" -f $i.Home)
+  Say ("  安装目录    : {0}" -f $(if ($i.Exists) { $i.Dir } else { "$($i.Dir)  (不存在)" }))
+  Say ("  版本        : {0}" -f $i.Version)
+  Say ("  commit      : {0}" -f $i.Commit)
+  Say ("  渠道        : {0}" -f $i.Channel)
+  Say ("  形态        : payload={0}  updateMechanism={1}" -f $i.Payload, $i.UpdateMech)
+  Say ("  桌面壳      : {0}" -f $(if ($i.Desktop) { "有 ($($i.DesktopExe))" } else { '无（纯 CLI）' }))
+  Say ("  Node 版本   : {0}" -f $i.NodePin)
+  $rootDrive = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($i.Home))
+  $free = ([IO.DriveInfo]::new($rootDrive)).AvailableFreeSpace / 1GB
+  Say ("  磁盘余量    : {0:N1} GB" -f $free)
+  Say '─────────────────────────────────────────────────────────────────' 'Cyan'
+}
+
+# ─── 2. 目标版本 ────────────────────────────────────────────────────────────
+function Get-Token {
+  foreach ($n in @('GITHUB_TOKEN','GH_TOKEN')) {
+    $v = [Environment]::GetEnvironmentVariable($n)
+    if ($v) { return $v.Trim() }
+  }
+  if (Get-Command gh -ErrorAction SilentlyContinue) {
+    $t = & gh auth token 2>$null
+    if ($t) { return ("$t").Trim() }
+  }
+  Fail '没有可用 GitHub token：装 gh 并 gh auth login，或设置 GITHUB_TOKEN 环境变量（需 repo 读权限）'
+}
+
+function Api-Get([string]$path) {
+  $h = @{
+    Authorization = "token $script:Token"
+    Accept        = 'application/vnd.github+json'
+    'User-Agent'  = 'hermes-prebuild'
+  }
+  Invoke-RestMethod -Uri "https://api.github.com/$path" -Headers $h -TimeoutSec 90 -ErrorAction Stop
+}
+
+function Resolve-TargetSha($i, [string]$want) {
+  $script:Token = Get-Token
+  if ($want) {
+    try { $sha = (Api-Get "repos/$Upstream/commits/$want").sha } catch { Fail "解析不了 ref '$want'（上游不存在这个分支/tag/SHA）" }
+    return @{ Ref = $want; Sha = $sha.Trim() }
+  }
+  if ($i.Channel -eq 'stable') {
+    $tag = (Api-Get "repos/$Upstream/releases/latest").tag_name
+    $sha = (Api-Get "repos/$Upstream/commits/$tag").sha
+    return @{ Ref = $tag; Sha = $sha.Trim() }
+  }
+  $sha = (Api-Get "repos/$Upstream/commits/main").sha
+  @{ Ref = 'main'; Sha = $sha.Trim() }
+}
+
+# ─── 3. 找产物 ──────────────────────────────────────────────────────────────
+function Find-Artifact($i, $short) {
+  $kind = if ($i.Desktop) { "hermes-win-$Arch-$short" } else { "hermes-cli-win-$Arch-$short" }
+  $resp = Api-Get "repos/$BuilderRepo/actions/artifacts?per_page=100"
+  $hit = @($resp.artifacts | Where-Object { $_.name -eq $kind -and -not $_.expired } | Sort-Object id -Descending)[0]
+  if (-not $hit) { return $null }
+  [pscustomobject]@{ Id = $hit.id; Name = $hit.name; Expired = $hit.expired; Size = [int64]$hit.size_in_bytes }
+}
+
+# ─── 4. 下载 + 校验 ─────────────────────────────────────────────────────────
+function Get-Artifact($art) {
+  $tmp = Join-Path $env:TEMP "hermes-prebuild-$($art.Id)"
+  Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+  $zip = Join-Path $tmp 'payload.zip'
+  $token = $script:Token
+  Say ("  下载 {0}（{1:N0} MB）..." -f $art.Name, ($art.Size / 1MB))
+  $curlProxy = @()
+  if ($script:ProxyUrl) { $curlProxy = @('-x', $script:ProxyUrl) }
+  & curl.exe -fsSL @curlProxy -H "Authorization: token $token" -H "Accept: application/zip" `
+    --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 `
+    -o $zip "https://api.github.com/repos/$BuilderRepo/actions/artifacts/$($art.Id)/zip"
+  if ($LASTEXITCODE -ne 0) { Fail "下载失败（curl 退出码 $LASTEXITCODE）" }
+  Expand-Archive -Path $zip -DestinationPath (Join-Path $tmp 'x') -Force
+  Ok ("已解包到 {0}" -f (Join-Path $tmp 'x'))
+  Join-Path $tmp 'x'
+}
+
+function Verify-Payload($root, $target, $i) {
+  $bad = @()
+  $man = Join-Path $root 'manifest.json'
+  if (-not (Test-Path $man)) { $bad += 'manifest.json 缺失' }
+  else {
+    $m = Get-Content $man -Raw | ConvertFrom-Json
+    if ($m.sha -ne $target.Sha) { $bad += "manifest.sha=$($m.sha) != 目标 $($target.Sha)" }
+    if ($m.platform -ne 'win32')  { $bad += "manifest.platform=$($m.platform) 不是 win32" }
+    if ($m.arch -ne $Arch)        { $bad += "manifest.arch=$($m.arch) 不是 $Arch" }
+    if ($i.NodePin -ne 'unknown' -and $m.node -ne $i.NodePin) { $bad += "manifest.node=$($m.node) != 本机 $($i.NodePin)" }
+  }
+  if ($i.Desktop) {
+    $st = Join-Path $root 'apps/desktop/release/win-unpacked/resources/install-stamp.json'
+    if (-not (Test-Path $st)) { $bad += 'win-unpacked/resources/install-stamp.json 缺失' }
+    else {
+      $s = Get-Content $st -Raw | ConvertFrom-Json
+      if ($s.commit -ne $target.Sha) { $bad += "烘焙 stamp.commit=$($s.commit) != 目标 $($target.Sha)（覆盖也不会命中）" }
+    }
+    $exe = Join-Path $root 'apps/desktop/release/win-unpacked/Hermes.exe'
+    if (-not (Test-Path $exe)) { $bad += 'win-unpacked/Hermes.exe 缺失' }
+  }
+  foreach ($r in @('hermes_cli/web_dist/hermes-build.json', 'ui-tui/dist/hermes-build.json',
+                   'apps/desktop/dist/hermes-build.json')) {
+    $p = Join-Path $root $r
+    if (-not (Test-Path $p)) { if ($r -like 'apps/desktop/*' -and -not $i.Desktop) { continue }; $bad += "$r 缺失" }
+  }
+  if ($bad.Count) { Say '  校验未通过：' 'Red'; $bad | ForEach-Object { Say "    - $_" 'Red' }; return $false }
+  Ok '校验通过：manifest / 烘焙 stamp / receipts 全部匹配'
+  $true
+}
+
+# ─── 5. 备份 / 覆盖 / 回滚 ─────────────────────────────────────────────────
+function Backup-Current($i) {
+  $bk = Join-Path $i.Dir ".hermes-prebuild-backup-$($script:StampTs)"
+  New-Item -ItemType Directory -Force -Path $bk | Out-Null
+  $moved = 0
+  foreach ($rel in @('apps/desktop/release/win-unpacked', 'apps/desktop/dist', 'apps/desktop/build/install-stamp.json',
+                     'hermes_cli/web_dist', 'ui-tui/dist')) {
+    $src = Join-Path $i.Dir $rel
+    if (Test-Path $src) {
+      $dst = Join-Path $bk $rel
+      New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
+      Move-Item $src $dst; $moved++
+    }
+  }
+  Ok ("旧产物已备份到 {0}（{1} 项）" -f $bk, $moved)
+  $bk
+}
+
+function Apply-Payload($root, $i) {
+  $pairs = @(
+    @{ Src = 'apps/desktop/release/win-unpacked'; Dst = 'apps/desktop/release/win-unpacked' },
+    @{ Src = 'apps/desktop/dist';                 Dst = 'apps/desktop/dist' },
+    @{ Src = 'apps/desktop/build/install-stamp.json'; Dst = 'apps/desktop/build/install-stamp.json' },
+    @{ Src = 'hermes_cli/web_dist';               Dst = 'hermes_cli/web_dist' },
+    @{ Src = 'ui-tui/dist';                       Dst = 'ui-tui/dist' }
+  )
+  foreach ($p in $pairs) {
+    $s = Join-Path $root $p.Src
+    if (-not (Test-Path $s)) { continue }
+    $d = Join-Path $i.Dir $p.Dst
+    New-Item -ItemType Directory -Force -Path (Split-Path $d) | Out-Null
+    Copy-Item $s -Destination $d -Recurse -Force
+    Ok ("覆盖 {0}" -f $p.Dst)
+  }
+}
+
+function Invoke-Rollback($i) {
+  $bks = Get-ChildItem $i.Dir -Directory -Filter '.hermes-prebuild-backup-*' | Sort-Object Name -Descending
+  if (-not $bks) { Fail '没有可回滚的备份' }
+  $bk = $bks[0].FullName
+  Say ("回滚到 {0}" -f $bk) 'Yellow'
+  foreach ($rel in @('apps/desktop/release/win-unpacked', 'apps/desktop/dist', 'apps/desktop/build/install-stamp.json',
+                     'hermes_cli/web_dist', 'ui-tui/dist')) {
+    $src = Join-Path $bk $rel
+    if (-not (Test-Path $src)) { continue }
+    $dst = Join-Path $i.Dir $rel
+    Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
+    Move-Item $src $dst
+    Ok ("恢复 {0}" -f $rel)
+  }
+}
+
+function Assert-DesktopClosed($i) {
+  if (-not $i.Desktop) { return }
+  $p = Get-Process -Name 'Hermes' -ErrorAction SilentlyContinue
+  if ($p) { Fail ('Hermes 桌面正在运行（pid {0}）。Windows 会锁住 win-unpacked 里的 exe，先退出桌面再跑。' -f ($p.Id -join ',')) }
+}
+
+# ─── 主流程 ────────────────────────────────────────────────────────────────
+$i = Get-HermesInstall
+Show-Install $i
+if ($i.Payload -eq 'legacy') {
+  Warn '这台是老安装（没有 install-stamp.json）：产物可能对不上，建议先正常跑一次 hermes update 再回来用本脚本'
+}
+
+# 代理：命令行 > 系统设置 > 直连
+$px = Resolve-Proxy
+$script:ProxyUrl = $px.Url
+Set-ProxyEnv $px.Url
+Say ''
+Say ("代理        : {0}  [{1}]" -f $(if ($px.Url) { $px.Url } else { '直连' }), $px.Source) 'Cyan'
+if ($px.Url) {
+  if (-not (Test-Proxy $px.Url)) {
+    if ($Diagnose) {
+      Warn '诊断模式：不提示，本次按直连继续'
+      $script:ProxyUrl = $null; Set-ProxyEnv $null
+    } elseif ($Yes) {
+      Fail '代理不可用，且处于 -Yes 非交互模式；换 -Proxy 或加 -NoProxy'
+    } else {
+      $q = Read-Host '代理不通，改用直连继续？(y/N)'
+      if ($q -match '^[Yy]') { $script:ProxyUrl = $null; Set-ProxyEnv $null; Say '  改为直连' 'Yellow' }
+      else { return }
+    }
+  }
+}
+
+if ($Rollback) { Invoke-Rollback $i; return }
+if ($Diagnose -or (-not $Ref -and -not $Yes)) {
+  Say ''
+  Say '── 可选操作 ─────────────────────────────────────────────────────' 'Cyan'
+  Say '  1) 只检查：本机版本 vs 上游目标版本，看有没有对应的预编译产物'
+  Say '  2) 下载并覆盖产物（不跑 hermes update）'
+  Say '  3) 下载覆盖 + 运行 hermes update（推荐）'
+  Say '  4) 选一个具体 tag/SHA 再执行'
+  Say '  5) 回滚到上一次备份'
+  Say ("  6) 手动指定代理（当前：{0}）" -f $(if ($script:ProxyUrl) { $script:ProxyUrl } else { '直连' }))
+  Say '  0) 退出'
+  Say '─────────────────────────────────────────────────────────────────' 'Cyan'
+  if ($Diagnose) { return }
+  $choice = Read-Host '选择'
+  switch ($choice) {
+    '1' { $Ref = $Ref }
+    '2' { $SkipUpdate = $true }
+    '3' { }
+    '4' { $Ref = Read-Host '  输入 tag / 分支 / SHA（如 v0.23.1）' }
+    '5' { Invoke-Rollback $i; return }
+    '6' {
+      $p = Read-Host '  输入代理（ip:端口 或 http://ip:端口 / socks5://ip:端口，留空=直连）'
+      if ($p) {
+        $u = if ($p -match '^[a-z0-9]+://') { $p } else { "http://$p" }
+        $script:ProxyUrl = $u; Set-ProxyEnv $u
+        if (-not (Test-Proxy $u)) { Warn '代理不通，仍会尝试（下载失败会报错）' }
+      } else { $script:ProxyUrl = $null; Set-ProxyEnv $null; Say '  已改为直连' 'Yellow' }
+    }
+    default { return }
+  }
+}
+
+$target = Resolve-TargetSha $i $Ref
+Say ''
+Say ("目标：{0} @ {1}" -f $target.Ref, $target.Sha.Substring(0, 12)) 'Cyan'
+if ($i.Commit -eq $target.Sha) { Warn '本机已经在这个 commit 上，覆盖没有意义（除非产物丢了）' }
+
+$art = Find-Artifact $i $target.Sha.Substring(0, 12)
+if (-not $art) {
+  Warn ("找不到产物 {0}（CI 可能还没编这个 SHA，或已过期）" -f $target.Sha.Substring(0, 12))
+  Say '  处理：在 hermes-prebuild 上手动 dispatch：' 'Yellow'
+  Say ("    gh workflow run prebuild.yml -R {0} -f ref={1}" -f $BuilderRepo, $target.Ref) 'Yellow'
+  return
+}
+Ok ("找到产物 {0}（{1:N0} MB, id={2}）" -f $art.Name, ($art.Size / 1MB), $art.Id)
+
+$root = Get-Artifact $art
+if (-not (Verify-Payload $root $target $i)) {
+  Say '  产物校验不过 → 不覆盖，保持现状（下次 hermes update 会本地全量编译）' 'Yellow'
+  return
+}
+
+if ($DryRun) { Say ''; Say '[DryRun] 检查全部通过，未改动任何文件' 'Cyan'; return }
+
+Assert-DesktopClosed $i
+if (-not $Yes) {
+  $go = Read-Host '确认覆盖？(y/N)'
+  if ($go -notmatch '^[Yy]') { Say '已取消' 'Yellow'; return }
+}
+
+$bk = Backup-Current $i
+try {
+  Apply-Payload $root $i
+  Ok '覆盖完成'
+} catch {
+  Warn ("覆盖失败：{0}" -f $_.Exception.Message)
+  Say '  正在回滚...' 'Yellow'
+  Invoke-Rollback $i
+  Fail '已回滚到覆盖前状态'
+}
+
+if (-not $SkipUpdate) {
+  Say ''
+  Say '── 运行 hermes update（build 段应命中 receipt 直接跳过）────────────' 'Cyan'
+  $cli = if ($i.Cli) { $i.Cli } else { 'hermes' }
+  & $cli update
+  if ($LASTEXITCODE -ne 0) {
+    Warn ("hermes update 退出码 {0}" -f $LASTEXITCODE)
+    Say ("  产物备份在 {0}；需要的话： .\hermes-update.ps1 -Rollback" -f $bk) 'Yellow'
+  }
+} else {
+  Say ''
+  Ok '已跳过 hermes update。之后手动跑：hermes update'
+}
+Say ''
+Say ("完成。备份目录：{0}" -f $bk) 'Cyan'
