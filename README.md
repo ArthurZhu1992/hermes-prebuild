@@ -32,31 +32,41 @@ powershell -ExecutionPolicy Bypass -File .\hermes-update.ps1 -Ref v0.23.1 -Yes
 
 ## 1. 产物
 
-每次构建按 ref 产三种 artifact（名字 = `hermes-<os>-<arch>-<sha12>`，保留 7 天）：
+每次构建按 ref 产四种 artifact（名字 = `hermes-<os>-<arch>-<sha12>`，保留 7 天）：
 
 | artifact | 内容 | zip 后 |
 |---|---|---|
 | `hermes-win-x64-<sha12>` | `apps/desktop/release/win-unpacked`、`apps/desktop/dist`、`apps/desktop/build/install-stamp.json`、`hermes_cli/web_dist`、`ui-tui/dist` | ~150 MB |
 | `hermes-linux-x64-<sha12>` | 同上，`linux-unpacked` | ~150 MB |
-| `hermes-cli-linux-<sha12>` | 只有 `hermes_cli/web_dist` + `ui-tui/dist`（纯 CLI 机器，无 Electron） | ~8 MB |
+| `hermes-cli-linux-<sha12>` | 只有 `hermes_cli/web_dist` + `ui-tui/dist`（纯 CLI 机器，无 Electron） | ~2.4 MB |
+| `hermes-cli-win-x64-<sha12>` | 同上，`manifest.platform=win32`（Windows 纯 CLI 机器） | ~2.4 MB |
 
-同一批产物还会**双写**到单一 release：**https://github.com/ArthurZhu1992/hermes-prebuild/releases/tag/prebuild**
+同一批产物还会再发一份到 **Releases** —— **一个版本一条 release，跟上游 releases 页同一个形状**：
 
-release 标题直接带版本号（每次构建刷新）：
+| 线 | release tag | 标题 | 保留策略 |
+|---|---|---|---|
+| stable | `v0.23.1`（直接沿用上游 tag） | `预编译产物 · v0.23.1` | **永久**，回退锚点 |
+| main | `main` | `预编译产物 · main · v0.23.1.7919` | 滚动，只留最近 2 个 SHA |
+| 任意上游 tag（`--ref v0.22.7`） | `v0.22.7` | `预编译产物 · v0.22.7` | **永久**，每个正式版都能回退 |
+| 任意分支（`--ref mybranch`） | `main` | `预编译产物 · main · v0.23.1-mybranch.gb9cb7a2` | 滚动，只留最近 2 个 SHA |
+
+版本号只出上游语义版本，不掺 git describe 尾巴：
 
 ```
-预编译产物 · main v0.23.2+416.ga347930      ← main 线：最近正式版 + 距离 + 短 sha
-预编译产物 · v0.23.1 v0.23.1                ← stable 线：就是那个 tag
+v0.23.1                     ← sha == 上游最新 release tag 的 sha（stable 线）
+v0.23.1.7919                ← main：距 v0.23.1 第 7919 个提交（第四段，天然可排序）
+v0.23.1-mybranch.gb9cb7a2   ← 任意 dispatch ref
 ```
 
-`latest.json` 里是机器可读的同一份信息：`{ref, sha, short, version, built_at, assets[]}`。
+不会再出现 `v0.23.1+7919.gb9cb7a2` 这种形式。
+
+每条 release 自带一份 `manifest.json`（`{version, ref, sha, base, stable, built_at, assets[]}`），
+脚本从产物里的这份文件读版本号，不依赖滚动覆盖的 `latest.json`；`latest.json` 只服务 `main` 那条线。
 
 | 通道 | 位置 | 有效期 | 下载是否需要登录 | 实际走哪个域 |
 |---|---|---|---|---|
 | artifact | Actions 产物 | 7 天 | **需要** | Azure blob（国内常可达） |
-| release | `prebuild` release，资产名带 sha12 | **永久** | **不需要**，匿名直链 | objects.githubusercontent（本机实测 4.7 MB/s） |
-
-release 里只保留最近 3 个 SHA 的资产（9 个文件）+ `latest.json`（记录当前 SHA/ref/构建时间）。
+| release | 一个版本一条 release，资产名带 sha12 | **永久**（main 线滚动） | **不需要** | api.github.com → release-assets.githubusercontent.com |
 
 脚本用 `--source` 选通道（PS 是 `-Source`）：
 

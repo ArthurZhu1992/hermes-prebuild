@@ -220,14 +220,27 @@ function Find-Artifact($i, $short) {
   [pscustomobject]@{ Id = $hit.id; Name = $hit.name; Expired = $hit.expired; Size = [int64]$hit.size_in_bytes; Kind = 'artifact'; Url = $null }
 }
 
-# release 通道：资产名 = <artifact 名>.zip，走 browser_download_url（公开仓库匿名可下、不过期）
+# release 通道：资产名 = <artifact 名>.zip
+# 发布结构：stable 线 tag = 版本号本身（v0.23.1，永久）；main 线 tag = main（滚动）；
+#           prebuild 为旧滚动 release，迁移期兜底。
 function Find-ReleaseAsset($i, $short) {
   $kind = if ($i.Desktop) { "hermes-win-$Arch-$short" } else { "hermes-cli-win-$Arch-$short" }
   $zipName = "$kind.zip"
-  try { $rel = Api-Get "repos/$BuilderRepo/releases/tags/prebuild" } catch { return $null }
-  $a = @($rel.assets | Where-Object { $_.name -eq $zipName })[0]
-  if (-not $a) { return $null }
-  [pscustomobject]@{ Id = $null; Name = $a.name; Expired = $false; Size = [int64]$a.size; Kind = 'release'; Url = $a.browser_download_url }
+  $slugs = @()
+  if ($target.Ref -match '^v') { $slugs += $target.Ref }
+  $slugs += @('main', 'prebuild')
+  foreach ($slug in $slugs) {
+    try { $rel = Api-Get "repos/$BuilderRepo/releases/tags/$slug" } catch { continue }
+    $a = @($rel.assets | Where-Object { $_.name -eq $zipName })[0]
+    if (-not $a) { continue }
+    Say ("  命中 release「{0}」" -f $slug)
+    # Id 非空 → 下载走 api.github.com/releases/assets/<id>（github.com 在国内常整段不通）
+    return [pscustomobject]@{
+      Id = [int64]$a.id; Name = $a.name; Expired = $false; Size = [int64]$a.size
+      Kind = 'release'; Url = $a.browser_download_url
+    }
+  }
+  return $null
 }
 
 function Locate-Payload($i, $short) {
@@ -253,17 +266,34 @@ function Get-Artifact($art) {
   $curlProxy = @()
   if ($script:ProxyUrl) { $curlProxy = @('-x', $script:ProxyUrl) }
   if ($art.Kind -eq 'release') {
-    & curl.exe -fsSL @curlProxy --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 `
-      -o $zip $art.Url
+    $ok = $false
+    if ($art.Id) {
+      $hdr = @('-H', 'Accept: application/octet-stream')
+      if ($token) { $hdr += @('-H', "Authorization: token $token") }
+      & curl.exe -fsSL @curlProxy @hdr --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 `
+        -o $zip "https://api.github.com/repos/$BuilderRepo/releases/assets/$($art.Id)"
+      $ok = ($LASTEXITCODE -eq 0)
+    }
+    if (-not $ok) {
+      & curl.exe -fsSL @curlProxy --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 `
+        -o $zip $art.Url
+    }
   } else {
     & curl.exe -fsSL @curlProxy -H "Authorization: token $token" -H "Accept: application/zip" `
       --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 `
       -o $zip "https://api.github.com/repos/$BuilderRepo/actions/artifacts/$($art.Id)/zip"
   }
   if ($LASTEXITCODE -ne 0) { Fail "下载失败（curl 退出码 $LASTEXITCODE）" }
-  Expand-Archive -Path $zip -DestinationPath (Join-Path $tmp 'x') -Force
-  Ok ("已解包到 {0}" -f (Join-Path $tmp 'x'))
-  Join-Path $tmp 'x'
+  $x = Join-Path $tmp 'x'
+  Expand-Archive -Path $zip -DestinationPath $x -Force
+  # 产物 zip 顶层带一层目录（artifact 名 / release 资产名）→ manifest.json 不在根上，降一层
+  if (-not (Test-Path (Join-Path $x 'manifest.json'))) {
+    $mj = Get-ChildItem -Path $x -Filter 'manifest.json' -Recurse -Depth 2 -File |
+          Select-Object -First 1
+    if ($mj) { $x = $mj.Directory.FullName }
+  }
+  Ok ("已解包到 {0}" -f $x)
+  $x
 }
 
 function Verify-Payload($root, $target, $i) {
@@ -429,18 +459,16 @@ if (-not $art) {
   return
 }
 Ok ("找到产物 {0}（{1:N0} MB，通道={2}）" -f $art.Name, ($art.Size / 1MB), $art.Kind)
-try {
-  $prevEap2 = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-  $lj = Invoke-RestMethod -Uri "https://github.com/$BuilderRepo/releases/download/prebuild/latest.json" -TimeoutSec 30
-  $ErrorActionPreference = $prevEap2
-  if ($lj.sha -eq $target.Sha) { Ok ("对应版本：{0}" -f $lj.version) }
-} catch {}
-
 $root = Get-Artifact $art
 if (-not (Verify-Payload $root $target $i)) {
   Say '  产物校验不过 → 不覆盖，保持现状（下次 hermes update 会本地全量编译）' 'Yellow'
   return
 }
+# 版本号从产物自带的 manifest.json 读，不再依赖滚动的 latest.json
+try {
+  $m = Get-Content (Join-Path $root 'manifest.json') -Raw | ConvertFrom-Json
+  if ($m.version) { Ok ("对应版本：{0}" -f $m.version) }
+} catch {}
 
 if ($DryRun) { Say ''; Say '[DryRun] 检查全部通过，未改动任何文件' 'Cyan'; return }
 

@@ -215,14 +215,30 @@ find_artifact() {
   ART_ID=${ART%% *}; ART_SIZE=${ART##* }; ART_NAME="$want"; PAYLOAD_KIND=artifact
 }
 
-# release 通道：资产名 = <artifact 名>.zip，走 browser_download_url（公开仓库匿名可下、不过期）
+# release 通道：资产名 = <artifact 名>.zip
+# 发布结构（两条线分开，Releases 列表才看得懂）：
+#   stable 线   tag = 版本号本身（v0.23.1）  永久保留，回退锚点
+#   main   线   tag = main，标题带版本号     滚动，只留最近 2 个 SHA
+#   prebuild   旧滚动 release，迁移期兜底
+release_asset() {   # <release-tag> <asset-name>  →  "id size url"
+  api_get "repos/$BUILDER_REPO/releases/tags/$1" \
+    ".assets[] | select(.name==\"$2\") | \"\(.id) \(.size) \(.browser_download_url)\"" 2>/dev/null
+}
+
 find_release_asset() {
-  local want_zip="$want.zip" jqf url size
-  jqf=".assets[] | select(.name==\"$want_zip\")"
-  url=$(api_get "repos/$BUILDER_REPO/releases/tags/prebuild" "$jqf | .browser_download_url" 2>/dev/null)
-  [ -n "${url:-}" ] || return 1
-  size=$(api_get "repos/$BUILDER_REPO/releases/tags/prebuild" "$jqf | .size" 2>/dev/null)
-  ART_URL="$url"; ART_NAME="$want_zip"; ART_SIZE="${size:-0}"; PAYLOAD_KIND=release
+  local want_zip="$want.zip" line slug slugs=()
+  if [ -n "${T_REF:-}" ]; then case "$T_REF" in v*) slugs+=("$T_REF");; esac; fi
+  slugs+=(main prebuild)
+  for slug in "${slugs[@]}"; do
+    if line=$(release_asset "$slug" "$want_zip") && [ -n "${line:-}" ]; then
+      ART_ID=${line%% *}; line=${line#* }
+      ART_SIZE=${line%% *}; ART_URL=${line#* }
+      ART_NAME="$want_zip"; PAYLOAD_KIND=release
+      say "  命中 release「$slug」"
+      return 0
+    fi
+  done
+  return 1
 }
 
 locate_payload() {
@@ -236,12 +252,25 @@ locate_payload() {
 # ─── 3. 下载 + 校验 ─────────────────────────────────────────────────────────
 download() {
   TMP=$(mktemp -d "/tmp/hermes-prebuild.XXXXXX")
-  local px=(); [ -n "$PX" ] && px=(-x "$PX")
+  local px=() auth=()
+  [ -n "$PX" ] && px=(-x "$PX")
+  [ -n "${TOKEN:-}" ] && auth=(-H "Authorization: token $TOKEN")
   say "  下载 $ART_NAME（$((ART_SIZE/1024/1024)) MB，通道=$PAYLOAD_KIND）${PX:+（经代理 $PX）}..."
   if [ "$PAYLOAD_KIND" = release ]; then
-    curl -fsSL ${px[@]+"${px[@]}"} --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 \
-         -o "$TMP/payload.zip" "$ART_URL" \
-         || die 'release 资产下载失败（国内直连常 0 B/s，加 --proxy 再试）'
+    # 优先 api.github.com（资产 id → 302 到 release-assets.githubusercontent.com）：
+    # github.com 在国内常被整段 RST，browser_download_url 直接 0 B/s，而 api 域名一般可达。
+    local got=0
+    if [ -n "${ART_ID:-}" ]; then
+      curl -fsSL ${px[@]+"${px[@]}"} ${auth[@]+"${auth[@]}"} -H 'Accept: application/octet-stream' \
+           --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 \
+           -o "$TMP/payload.zip" "https://api.github.com/repos/$BUILDER_REPO/releases/assets/$ART_ID" \
+           && got=1
+    fi
+    if [ "$got" = 0 ]; then
+      curl -fsSL ${px[@]+"${px[@]}"} --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 \
+           -o "$TMP/payload.zip" "$ART_URL" \
+           || die 'release 资产下载失败（api 与 github.com 都不通，加 --proxy 再试）'
+    fi
   else
     [ -n "$TOKEN" ] || die 'artifact 通道需要 GitHub token；改用 --source release（匿名可下）'
     curl -fsSL ${px[@]+"${px[@]}"} -H "Authorization: token $TOKEN" -H "Accept: application/zip" \
@@ -253,7 +282,13 @@ download() {
   if command -v unzip >/dev/null; then unzip -q "$TMP/payload.zip" -d "$TMP/x"
   else python3 -c "import zipfile,sys;zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$TMP/payload.zip" "$TMP/x"; fi
   ROOT="$TMP/x"
-  ok "已解包到 $ROOT"
+  # 产物 zip 顶层带一层目录（artifact 名 / release 资产名），manifest.json 因此不在根上 → 降一层。
+  # 少了这段，release / artifact 两条通道的 verify 都会判 manifest.json 缺失，覆盖永远不执行。
+  if [ ! -f "$ROOT/manifest.json" ]; then
+    mj=$(find "$ROOT" -maxdepth 3 -name manifest.json -print -quit 2>/dev/null)
+    [ -n "${mj:-}" ] && ROOT=$(dirname "$mj")
+  fi
+  ok "已解包到 ${ROOT#$TMP/x/}"
 }
 
 verify() {
@@ -399,12 +434,11 @@ if ! locate_payload; then
   exit 1
 fi
 ok "找到产物 $ART_NAME（$((ART_SIZE/1024/1024)) MB，通道=$PAYLOAD_KIND）"
-  local vpx=(); [ -n "$PX" ] && vpx=(-x "$PX")
-  ver=$(curl -fsSL ${vpx[@]+"${vpx[@]}"} --max-time 20 "https://github.com/$BUILDER_REPO/releases/download/prebuild/latest.json" 2>/dev/null         | jq -r --arg s "$T_SHA" 'select(.sha==$s) | .version // empty' 2>/dev/null)
-  [ -n "${ver:-}" ] && ok "对应版本：$ver"
-
 download
 verify || { warn '产物校验不过 → 不覆盖，保持现状（下次 hermes update 会本地全量编译）'; exit 1; }
+# 版本号从产物自带的 manifest.json 读：stable 线每个版本一份，main 线每批一份，不依赖滚动的 latest.json
+ver=$(python3 -c "import json;print(json.load(open('$ROOT/manifest.json')).get('version',''))" 2>/dev/null || true)
+[ -n "${ver:-}" ] && ok "对应版本：$ver" 
 [ "$DRY_RUN" = 1 ] && { head_ ''; c '0;36' '[DryRun] 检查全部通过，未改动任何文件'; exit 0; }
 
 assert_closed

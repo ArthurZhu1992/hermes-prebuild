@@ -6,8 +6,15 @@ name: Hermes prebuild
 # 产物（artifact 名 = hermes-<os>-<arch>-<sha12>）：
 #   hermes-win-x64-<sha12>      win-unpacked + apps/desktop/dist + build/install-stamp.json + web_dist + ui-tui/dist
 #   hermes-linux-x64-<sha12>    同上，linux-unpacked
-#   hermes-cli-linux-<sha12>    只含 web_dist + ui-tui/dist（纯 CLI 机器用，~8 MB）
+#   hermes-cli-linux-<sha12>    只含 web_dist + ui-tui/dist（纯 CLI 机器用，~2.4 MB）
+#   hermes-cli-win-x64-<sha12>  同上，manifest.platform=win32（Windows 纯 CLI 机器）
 #   每个 artifact 内都有 manifest.json（ref/sha/platform/arch/node/built_at）
+#
+# 版本号（只出上游语义版本，不掺 git 描述符）：
+#   stable（sha == 上游最新 release tag 的 sha）  →  v0.23.1        release tag 同名，永久保留
+#   main  （最新 tag 之后的提交）                 →  v0.23.1.7919   release tag = main，滚动保留最近 2 个 SHA
+#   其它 ref（分支 / 任意 sha）                   →  v0.23.1-<ref>.g<sha7>
+#   Releases 列表因此是一串干净版本号 + 一条 main，跟上游 releases 页同一个形状。
 #
 # 触发：
 #   schedule  每天 03:17 UTC 检查一次上游 main，变了才构建（没变 10 秒早退）
@@ -26,13 +33,20 @@ on:
         default: false
   schedule:
     - cron: '17 3 * * *'
+  push:
+    branches: [main]
+    # 只在本仓库的构建器自身变化时跑，state/ 的自动提交不会回头触发（防循环）
+    paths:
+      - '.github/workflows/prebuild.yml'
+      - 'scripts/**'
 
 permissions:
   contents: write        # state/last-built.json 的提交
   actions: write         # 删旧 artifact 需要 write（只读会 403，被 set +e 吞掉）
 
 concurrency:
-  group: prebuild-${{ github.ref }}
+  # 按目标 ref 分组：stable 与 main 可以并行，同一 ref 的重复触发排队而不互相打断
+  group: prebuild-${{ inputs.ref || 'main' }}
   cancel-in-progress: false
 
 jobs:
@@ -44,6 +58,12 @@ jobs:
       changed: ${{ steps.r.outputs.changed }}
       ref: ${{ steps.r.outputs.ref }}
       version: ${{ steps.r.outputs.version }}
+      tag: ${{ steps.r.outputs.tag }}
+      stable: ${{ steps.r.outputs.stable }}
+      ahead: ${{ steps.r.outputs.ahead }}
+      persist: ${{ steps.r.outputs.persist }}
+      reltag: ${{ steps.r.outputs.reltag }}
+      nextref: ${{ steps.r.outputs.nextref }}
     steps:
       - uses: actions/checkout@v4          # 本仓库，为了读 state/
       - id: r
@@ -61,9 +81,16 @@ jobs:
           last_main=$(jq -r '."main".sha // "none"' state/last-built.json 2>/dev/null || echo none)
           last_tag=$(jq -r --arg t "$tag" '.[$t].sha // "none"' state/last-built.json 2>/dev/null || echo none)
 
+          # 本仓库有没有上游最新正式版的 release —— 没有说明是首次迁移或上游刚发新版，优先补
+          nextref=""
+          have_stable=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .tag_name 2>/dev/null || true)
+
           if [ -n "${INPUT_REF:-}" ]; then
             ref="$INPUT_REF"; sha=$(gh api "repos/$UP/commits/$ref" --jq .sha); changed=true
             echo "手动指定 ref=$ref"
+          elif [ -z "$have_stable" ]; then
+            ref="$tag"; sha="$tag_sha"; changed=true; nextref=main
+            echo "stable 缺口：$tag 还没有 release → 先编它，完成后链式编 main"
           elif [ "$main_sha" != "$last_main" ]; then
             ref=main; sha="$main_sha"; changed=true
             echo "main 有更新：$last_main -> $main_sha"
@@ -77,17 +104,41 @@ jobs:
           if [ "$FORCE" = "true" ]; then changed=true; fi
 
           short=${sha:0:12}
-          if [ "$sha" = "$tag_sha" ]; then version="$tag"
+
+          # ── 版本号：只出上游语义版本，不掺 git 描述符 ────────────────────────
+          #   stable（sha == 上游最新 release tag 的 sha）  →  v0.23.1
+          #   main  （最新 tag 之后的提交）                 →  v0.23.1.7919   ← 第四段 = 距该 tag 的 commit 数
+          #   其它 ref（分支 / 任意 sha）                   →  v0.23.1-<ref>.g<sha7>
+          # 上游自己的 canary 是 v0.23.1+canary.<UTC>；这里用纯数字四段，
+          # 排序天然正确（v0.23.1 < v0.23.1.7919 < v0.24.0），且能直接对到上游 release 页。
+          # persist=true  → 一条独立 release，tag 就是版本号，永久保留（上游正式版的预编译）
+          # persist=false → 一条 tag=main 的滚动 release，标题带版本号，只留最近 2 个 SHA
+          ahead=""; persist=false; reltag=main
+          if [ "$sha" = "$tag_sha" ]; then
+            persist=true; reltag="$tag"; version="$tag"; stable=true
+          elif [[ "$ref" == v[0-9]* ]]; then
+            # 手动指定上游 tag（含更老的正式版）→ 同样独立成 release
+            persist=true; reltag="$ref"; version="$ref"; stable=true
+          elif [ "$ref" = "main" ]; then
+            stable=false
+            ahead=$(gh api "repos/$UP/compare/$tag...$sha" --jq .ahead_by 2>/dev/null || true)
+            case "${ahead:-}" in
+              ''|*[!0-9]*) version="${tag}.main"; ahead="" ;;
+              *)           version="${tag}.${ahead}" ;;
+            esac
           else
-            ahead=$(gh api "repos/$UP/compare/$tag...$sha" --jq .ahead_by 2>/dev/null || echo 0)
-            version="${tag}+${ahead}.g${sha:0:7}"
+            stable=false
+            version="${tag}-$(printf '%s' "$ref" | tr '/' '-').g${sha:0:7}"
           fi
 
           {
             echo "sha=$sha"; echo "short=$short"; echo "ref=$ref"
             echo "changed=$changed"; echo "version=$version"
+            echo "tag=$tag"; echo "stable=$stable"; echo "ahead=${ahead:-}"
+            echo "persist=$persist"; echo "reltag=$reltag"
+            echo "nextref=${nextref:-}"
           } >> "$GITHUB_OUTPUT"
-          echo "ref=$ref sha=$sha version=$version changed=$changed"
+          echo "ref=$ref sha=$sha version=$version persist=$persist reltag=$reltag changed=$changed"
 
   # ── Windows 桌面壳 ────────────────────────────────────────────────────────
   build-win:
@@ -267,7 +318,15 @@ jobs:
           cp -a hermes_cli/web_dist/. ../payload-cli/hermes_cli/web_dist/
           cp -a ui-tui/dist/. ../payload-cli/ui-tui/dist/
           cp out/manifest.json ../payload-cli/
-          du -sh ../payload-full ../payload-cli
+          # Windows 纯 CLI：同一份前端产物（平台无关），只把 manifest.platform 改成 win32 让资产名与校验对位
+          cp -a ../payload-cli ../payload-cli-win
+          python3 - ../payload-cli-win/manifest.json <<'PY'
+          import json, sys
+          p = sys.argv[1]
+          d = json.load(open(p)); d["platform"] = "win32"
+          json.dump(d, open(p, "w"), indent=2)
+          PY
+          du -sh ../payload-full ../payload-cli ../payload-cli-win
 
       - uses: actions/upload-artifact@v4
         with:
@@ -280,6 +339,13 @@ jobs:
         with:
           name: hermes-cli-linux-${{ needs.resolve.outputs.short }}
           path: payload-cli
+          retention-days: 7
+          compression-level: 9
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermes-cli-win-x64-${{ needs.resolve.outputs.short }}
+          path: payload-cli-win
           retention-days: 7
           compression-level: 9
 
@@ -331,17 +397,35 @@ jobs:
           done < <(gh api "repos/${{ github.repository }}/actions/artifacts?per_page=100"                      --jq '.artifacts[] | "\(.id) \(.name)"')
           echo "保留 $kept 份（当前 SHA $SHORT），删除 $deleted 份"
 
-  # ── 双写：同一批产物再发一份到单一 release（永久、匿名可下、可回退）──────────
+  # ── 发布 ───────────────────────────────────────────────────────────────────
+  # 两条线分开，Releases 列表才干净：
+  #   persist（sha == 上游最新 release tag，或 --ref 指到某个上游 tag）
+  #              → 一条独立 release，tag 就是版本号（v0.23.1），永久保留，回退锚点
+  #   main 线   （tag 之后的提交 / 任意分支）
+  #              → 一条 tag=main 的滚动 release，标题带版本号，只留最近 2 个 SHA
+  # 资产名始终带 sha12，脚本按 sha12 精确取件；版本号只负责「人看」与「回退锚点」。
   publish:
     needs: [resolve, build-win, build-linux]
     if: needs.build-win.result == 'success' && needs.build-linux.result == 'success'
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      R: ${{ github.repository }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+      SHORT: ${{ needs.resolve.outputs.short }}
+      REF: ${{ needs.resolve.outputs.ref }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      BASE: ${{ needs.resolve.outputs.tag }}
+      STABLE: ${{ needs.resolve.outputs.stable }}
+      AHEAD: ${{ needs.resolve.outputs.ahead }}
+      PERSIST: ${{ needs.resolve.outputs.persist }}
+      RELTAG: ${{ needs.resolve.outputs.reltag }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
 
-      - name: 重新打包成 release 资产（文件名带 sha12）
+      - name: 打包成 release 资产（文件名带 sha12）
         run: |
           set -euo pipefail
           cd dist
@@ -351,23 +435,95 @@ jobs:
           done
           ls -la *.zip
 
-      - name: 上传到 release「prebuild」（标题带版本号）
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SHA: ${{ needs.resolve.outputs.sha }}
-          SHORT: ${{ needs.resolve.outputs.short }}
-          REF: ${{ needs.resolve.outputs.ref }}
-          VERSION: ${{ needs.resolve.outputs.version }}
+      - name: 决定 release 位置与标题
         run: |
           set -euo pipefail
-          R="${{ github.repository }}"
-          if ! gh release view prebuild -R "$R" >/dev/null 2>&1; then
-            gh release create prebuild -R "$R" --prerelease --title "预编译产物（滚动）" --notes "首次构建。"
+          if [ "$PERSIST" = "true" ]; then
+            echo "REL_TAG=$RELTAG"      >> "$GITHUB_ENV"
+            echo "REL_TITLE=预编译产物 · $VERSION" >> "$GITHUB_ENV"
+            echo "REL_PRE=false"        >> "$GITHUB_ENV"
+            echo "REL_KEEP=0"           >> "$GITHUB_ENV"   # 0 = 永久不清理
+          else
+            echo "REL_TAG=main"         >> "$GITHUB_ENV"
+            echo "REL_TITLE=预编译产物 · main · $VERSION" >> "$GITHUB_ENV"
+            echo "REL_PRE=true"         >> "$GITHUB_ENV"
+            echo "REL_KEEP=2"           >> "$GITHUB_ENV"   # 只留最近 2 个 SHA 的资产
           fi
 
-          # latest.json —— 脚本用它显示版本号
-          printf '{\n  "ref": "%s",\n  "sha": "%s",\n  "short": "%s",\n  "version": "%s",\n  "built_at": "%s",\n  "assets": [' \
-            "$REF" "$SHA" "$SHORT" "$VERSION" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > latest.json
+      - name: 写 release 说明
+        run: |
+          set -euo pipefail
+          {
+            printf '**版本** `%s`  ·  上游 `%s` @ `%s`\n\n' "$VERSION" "$REF" "$SHORT"
+            if [ "$PERSIST" = "true" ]; then
+              printf '> 上游正式版 `%s` 的预编译产物。**永久保留**，可随时 `--ref %s` 回退到此版本。\n\n' "$VERSION" "$VERSION"
+            elif [ -n "${AHEAD:-}" ]; then
+              printf '> `%s` 之后第 **%s** 个提交。滚动构建，只保留最近 2 个 SHA 的资产。\n\n' "$BASE" "$AHEAD"
+            else
+              printf '> 滚动构建，只保留最近 2 个 SHA 的资产。\n\n'
+            fi
+            printf '| 资产 | 大小 | 用于 |\n|---|---|---|\n'
+            for f in dist/*.zip; do
+              b=$(basename "$f")
+              case "$b" in
+                hermes-linux-x64-*) use='Linux 桌面壳 + CLI' ;;
+                hermes-win-x64-*)   use='Windows 桌面壳' ;;
+                hermes-cli-linux-*) use='纯 CLI（无 Electron）' ;;
+                hermes-cli-win-x64-*) use='纯 CLI（Windows）' ;;
+                *)                  use='—' ;;
+              esac
+              printf '| `%s` | %s MB | %s |\n' "$b" "$(( $(stat -c%s "$f") / 1048576 ))" "$use"
+            done
+            printf '\n构建时间 %s\n\n' "$(date -u '+%Y-%m-%d %H:%M UTC')"
+            printf '**用法**：`./hermes-update.sh --ref %s`（Windows: `-Ref %s`）。release 通道匿名可下，不需要 token。\n\n' "$REF" "$REF"
+            if [ "$PERSIST" = "true" ]; then
+              printf '**上游 release**：<https://github.com/NousResearch/hermes-agent/releases/tag/%s>（commit `%s`）\n' \
+                "$VERSION" "$SHA"
+            else
+              printf '**Full Changelog**：[%s...%s](https://github.com/NousResearch/hermes-agent/compare/%s...%s)\n' \
+                "$BASE" "${SHA:0:7}" "$BASE" "$SHA"
+            fi
+          } > notes.md
+
+          # manifest.json：这一批的权威元数据（脚本优先读它拿版本号，不再依赖滚动 latest.json）
+          node_v=$(python3 -c "import json;print(json.load(open('dist/hermes-linux-x64-$SHORT/manifest.json'))['node'])" 2>/dev/null || echo unknown)
+          python3 - "$VERSION" "$node_v" <<'PY' > manifest.json
+          import json, sys, os, datetime
+          json.dump({
+              "version": sys.argv[1],
+              "ref": os.environ["REF"],
+              "sha": os.environ["SHA"],
+              "short": os.environ["SHORT"],
+              "base": os.environ["BASE"],
+              "persist": os.environ["PERSIST"] == "true",
+              "platform": "all",
+              "node": sys.argv[2],
+              "built_at": datetime.datetime.now(datetime.UTC).isoformat(),
+              "workflow_run": os.environ.get("GITHUB_RUN_ID", ""),
+              "assets": sorted(x for x in os.listdir("dist") if x.endswith(".zip")),
+          }, sys.stdout, indent=2)
+          PY
+
+      - name: 上传到 release
+        run: |
+          set -euo pipefail
+          pre_flag=()
+          [ "$REL_PRE" = "true" ] && pre_flag=(--prerelease)
+          if ! gh release view "$REL_TAG" -R "$R" >/dev/null 2>&1; then
+            gh release create "$REL_TAG" -R "$R" --title "$REL_TITLE" --notes '首次构建。' "${pre_flag[@]}"
+          fi
+          gh release upload "$REL_TAG" dist/*.zip manifest.json -R "$R" --clobber
+          gh release edit "$REL_TAG" -R "$R" --title "$REL_TITLE" --notes-file notes.md
+          echo "--- $REL_TAG 现有资产 ---"
+          gh release view "$REL_TAG" -R "$R" --json assets --jq '.assets[]|"\(.name)\t\(.size)"'
+
+      # latest.json 只服务 main 滚动线（stable 线每个版本自带 manifest.json，永不覆盖）
+      - name: main 线维护 latest.json
+        if: needs.resolve.outputs.persist != 'true'
+        run: |
+          set -euo pipefail
+          printf '{\n  "ref": "%s",\n  "sha": "%s",\n  "short": "%s",\n  "version": "%s",\n  "base": "%s",\n  "built_at": "%s",\n  "assets": [' \
+            "$REF" "$SHA" "$SHORT" "$VERSION" "$BASE" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > latest.json
           first=1
           for f in dist/*.zip; do
             [ "$first" = 1 ] || printf ',' >> latest.json
@@ -375,32 +531,56 @@ jobs:
             printf '\n    "%s"' "$(basename "$f")" >> latest.json
           done
           printf '\n  ]\n}\n' >> latest.json
+          gh release upload "$REL_TAG" latest.json -R "$R" --clobber
 
-          # release 说明：版本号 + 本次资产表
-          {
-            printf '**版本 `%s`** · 上游 `%s` @ `%s`\n\n' "$VERSION" "$REF" "${SHA:0:12}"
-            printf '| 资产 | 大小 |\n|---|---|\n'
-            for f in dist/*.zip; do
-              printf '| `%s` | %s MB |\n' "$(basename "$f")" "$(( $(stat -c%s "$f") / 1048576 ))"
-            done
-            printf '\n构建时间 %s\n\n' "$(date -u '+%Y-%m-%d %H:%M UTC')"
-            printf '用法：`./hermes-update.sh --source release`（PS 里 `-Source release`），脚本按 sha12 自动挑资产。\n'
-            printf '只保留最近 3 个 SHA 的资产。\n'
-          } > notes.md
-
-          gh release upload prebuild dist/*.zip latest.json -R "$R" --clobber
-          gh release edit prebuild -R "$R" --title "预编译产物 · $REF $VERSION" --notes-file notes.md
-          echo "--- release 现有资产 ---"
-          gh release view prebuild -R "$R" --json assets --jq '.assets[]|"\(.name)\t\(.size)"'
-
-      - name: 只保留最近 9 个资产（3 个 SHA）
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: 清理旧资产（按 sha12 分组，整批进整批出）
+        if: needs.resolve.outputs.persist != 'true'
         run: |
           set +e
-          R="${{ github.repository }}"
-          gh release view prebuild -R "$R" --json assets --jq '.assets | sort_by(.createdAt) | reverse | .[9:] | .[].name' > old.txt
+          gh release view "$REL_TAG" -R "$R" --json assets \
+            --jq '.assets | sort_by(.createdAt) | reverse | .[].name' > all.txt
+          KEEP="$REL_KEEP" python3 - <<'PY' > del.txt
+          import os, re
+          keep_n = int(os.environ.get("KEEP", "2"))
+          names = [l.strip() for l in open("all.txt") if l.strip()]
+          META = {"latest.json", "manifest.json"}      # 元数据不占批位，永不删
+          def grp(n):
+              if n in META:
+                  return None
+              m = re.search(r'-([0-9a-f]{12})\.zip$', n)
+              return m.group(1) if m else n
+          order = []
+          for n in names:
+              g = grp(n)
+              if g and g not in order:
+                  order.append(g)
+          keep = set(order[:keep_n])
+          for n in names:
+              g = grp(n)
+              if g is not None and g not in keep:
+                  print(n)
+          PY
           while read -r name; do
             [ -z "$name" ] && continue
-            gh release delete-asset prebuild "$name" -R "$R" --yes && echo "deleted $name"
-          done < old.txt
+            gh release delete-asset "$REL_TAG" "$name" -R "$R" --yes && echo "deleted $name"
+          done < del.txt
+
+      # 一次性迁移：新的 main release 至少 3 个 zip 就位后，删掉旧的单一滚动 release「prebuild」
+      - name: 迁移：删掉旧的滚动 release「prebuild」
+        if: needs.resolve.outputs.persist != 'true'
+        run: |
+          set +e
+          n=$(gh release view main -R "$R" --json assets --jq '[.assets[]|select(.name|endswith(".zip"))]|length' 2>/dev/null)
+          n=${n:-0}
+          if [ "$n" -ge 3 ] && gh release view prebuild -R "$R" >/dev/null 2>&1; then
+            gh release delete prebuild -R "$R" --yes --cleanup-tag && echo "已删除旧 prebuild release（含 tag）"
+          else
+            echo "跳过迁移删除：main release 现有 $n 个 zip，或 prebuild 已不存在"
+          fi
+
+      # 链式：stable 缺口补完之后，自动接着编 main，省一次手动 dispatch（GITHUB_TOKEN 允许触发 workflow_dispatch）
+      - name: 链式触发下一条线
+        if: needs.resolve.outputs.nextref != ''
+        run: |
+          echo "接着编 ${{ needs.resolve.outputs.nextref }}"
+          gh workflow run prebuild.yml -R "$R" -f ref="${{ needs.resolve.outputs.nextref }}"
