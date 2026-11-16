@@ -64,6 +64,7 @@ jobs:
       persist: ${{ steps.r.outputs.persist }}
       reltag: ${{ steps.r.outputs.reltag }}
       nextref: ${{ steps.r.outputs.nextref }}
+      reason: ${{ steps.r.outputs.reason }}
     steps:
       - uses: actions/checkout@v4          # 本仓库，为了读 state/
       - id: r
@@ -81,26 +82,31 @@ jobs:
           last_main=$(jq -r '."main".sha // "none"' state/last-built.json 2>/dev/null || echo none)
           last_tag=$(jq -r --arg t "$tag" '.[$t].sha // "none"' state/last-built.json 2>/dev/null || echo none)
 
-          # 本仓库有没有上游最新正式版的 release —— 没有说明是首次迁移或上游刚发新版，优先补
-          nextref=""
-          have_stable=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .tag_name 2>/dev/null || true)
+          # 本仓库有没有上游最新正式版的 release —— 没有说明是首次迁移或上游刚发新版，优先补。
+          # 用列表 + index 判断，不依赖单条 /releases/tags/<tag> 的 404 行为（gh 各版本 stdout 不一致）。
+          nextref=""; reason=""
+          have_stable=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+                        --jq "[.[].tag_name] | index(\"$tag\")" 2>/dev/null || echo null)
+          case "$have_stable" in ''|null) have_stable="";; esac
+          echo "本仓库 $tag release：${have_stable:-不存在}"
 
           if [ -n "${INPUT_REF:-}" ]; then
             ref="$INPUT_REF"; sha=$(gh api "repos/$UP/commits/$ref" --jq .sha); changed=true
-            echo "手动指定 ref=$ref"
+            reason="手动指定 ref=$ref"
           elif [ -z "$have_stable" ]; then
             ref="$tag"; sha="$tag_sha"; changed=true; nextref=main
-            echo "stable 缺口：$tag 还没有 release → 先编它，完成后链式编 main"
+            reason="stable 缺口：$tag 还没有 release → 先编它，完成后链式编 main"
           elif [ "$main_sha" != "$last_main" ]; then
             ref=main; sha="$main_sha"; changed=true
-            echo "main 有更新：$last_main -> $main_sha"
+            reason="main 有更新：$last_main -> $main_sha"
           elif [ "$tag_sha" != "$last_tag" ]; then
             ref="$tag"; sha="$tag_sha"; changed=true
-            echo "stable 有新版本：$tag（$last_tag -> $tag_sha）"
+            reason="stable 有新版本：$tag（$last_tag -> $tag_sha）"
           else
             ref=main; sha="$main_sha"; changed=false
-            echo "main 与 stable 都没变，跳过"
+            reason="main 与 stable 都没变，跳过"
           fi
+          echo "$reason"
           if [ "$FORCE" = "true" ]; then changed=true; fi
 
           short=${sha:0:12}
@@ -136,7 +142,7 @@ jobs:
             echo "changed=$changed"; echo "version=$version"
             echo "tag=$tag"; echo "stable=$stable"; echo "ahead=${ahead:-}"
             echo "persist=$persist"; echo "reltag=$reltag"
-            echo "nextref=${nextref:-}"
+            echo "nextref=${nextref:-}"; echo "reason=$reason"
           } >> "$GITHUB_OUTPUT"
           echo "ref=$ref sha=$sha version=$version persist=$persist reltag=$reltag changed=$changed"
 
@@ -419,6 +425,7 @@ jobs:
       STABLE: ${{ needs.resolve.outputs.stable }}
       AHEAD: ${{ needs.resolve.outputs.ahead }}
       PERSIST: ${{ needs.resolve.outputs.persist }}
+      REASON: ${{ needs.resolve.outputs.reason }}
       RELTAG: ${{ needs.resolve.outputs.reltag }}
     steps:
       - uses: actions/download-artifact@v4
@@ -455,6 +462,7 @@ jobs:
           set -euo pipefail
           {
             printf '**版本** `%s`  ·  上游 `%s` @ `%s`\n\n' "$VERSION" "$REF" "$SHORT"
+            printf '> 决策：%s\n\n' "$REASON"
             if [ "$PERSIST" = "true" ]; then
               printf '> 上游正式版 `%s` 的预编译产物。**永久保留**，可随时 `--ref %s` 回退到此版本。\n\n' "$VERSION" "$VERSION"
             elif [ -n "${AHEAD:-}" ]; then
