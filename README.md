@@ -87,8 +87,15 @@ v0.23.1-mybranch.gb9cb7a2   ← 任意 dispatch ref
 
 | 方式 | 说明 |
 |---|---|
-| `schedule`（每天 03:17 UTC） | 先看 main 有没有新 commit；没有再看 stable 是否发了新 tag；两者都没变就 10 秒早退 |
-| `workflow_dispatch` | 手动指定任意 `ref`（分支 / tag / SHA），stable 发版后出包用这个 |
+| `schedule`（每天 03:17 UTC） | 先补 stable 缺口，再看 main 有没有新 commit；两者都没变就 10 秒早退 |
+| `push`（main） | 构建器自身（workflow / scripts）改动推上来就自动跑一次检查 |
+| `workflow_dispatch` | 手动指定任意 `ref`（分支 / tag / SHA），需要 token |
+
+优先级：**上游最新正式版在本仓库还没有 release** → 先编它（`v0.23.1`），跑完自动 dispatch 一次 `main`
+（`GITHUB_TOKEN` 允许触发 `workflow_dispatch`），所以一次 push 就能把两条线都补齐。
+
+`main` release 至少 3 个 zip 就位后，旧的单一滚动 release `prebuild` 会被自动删除 —— 迁移不需要手动操作。
+`scripts/migrate-release-layout.sh` 只是手动兜底（CI 已自动做完）。
 
 ```bash
 # stable 发新版后给 Linux 桌面端出包
