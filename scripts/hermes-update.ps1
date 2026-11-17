@@ -369,38 +369,40 @@ function Apply-Payload($root, $i) {
   }
 }
 
-# CI 烘焙的 receipt 里 prepared[].path 记的是构建机的绝对路径（D:\a\<repo>\<repo>\src\...）。
-# freshness.mjs 会拿这些 path 重算内容 hash 并逐字段比对，路径在目标机不存在就判「产物过期」→ 桌面壳白编一遍。
-# hash 是内容 hash（与路径无关，实测 icons/stamp 改写后 hash 完全一致），所以只把 "…\src\" 之前的前缀
-# 换成本机安装目录即可。必须写成无 BOM 的 UTF-8：带 BOM 会让 node 的 JSON.parse 直接抛错。
-function Repair-ReceiptPaths($i) {
-  $fixed = 0
-  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-  foreach ($rel in @('apps/desktop/dist/hermes-build.json', 'hermes_cli/web_dist/hermes-build.json',
-                     'ui-tui/dist/hermes-build.json')) {
-    $p = Join-Path $i.Dir $rel
-    if (-not (Test-Path $p)) { continue }
-    $raw = [IO.File]::ReadAllText($p)
-    try { $j = $raw | ConvertFrom-Json } catch { continue }
-    if (-not $j.inputs -or -not $j.inputs.prepared) { continue }
-    $changed = $false
-    foreach ($item in $j.inputs.prepared) {
-      $old = [string]$item.path
-      if (-not $old) { continue }
-      # CI 的 path 值里反斜杠成对出现（D:\\a\\...），按分隔符切最稳
-      $parts = @($old -split '[\\/]+' | Where-Object { $_ })
-      $idx = -1
-      for ($k = 0; $k -lt $parts.Count; $k++) { if ($parts[$k] -eq 'src') { $idx = $k } }
-      if ($idx -lt 0 -or $idx -ge ($parts.Count - 1)) { continue }
-      $relpath = ($parts[($idx + 1)..($parts.Count - 1)]) -join '\'
-      $new = Join-Path $i.Dir $relpath
-      if ($new -eq $old) { continue }
-      $raw = $raw.Replace($old.Replace('\', '\\'), $new.Replace('\', '\\'))
-      $changed = $true; $fixed++
-    }
-    if ($changed) { [IO.File]::WriteAllText($p, $raw, $utf8NoBom) }
+# CI 的 receipt 里 hash 是构建机算的：sourceHash 覆盖 .npmrc/源码树（构建过程自己会改 .npmrc），
+# prepared.nativeDeps 甚至与 CI 自己上传的目录都对不上 —— 跨机器永远为 false，桌面壳会白编一遍（实测 237 s）。
+# 所以覆盖后按本机源码树重签三份 receipt（hash 全部本地实算）。安全性由前面的校验兜着：
+# manifest.sha == 目标 SHA、win-unpacked 烘焙 stamp.commit == 目标 SHA、且 HEAD == 目标 SHA。
+function Get-NodeExe($i) {
+  $tools = Join-Path $env:HERMES_HOME 'tools'
+  $cands = @()
+  if ($i.NodePin -and $i.NodePin -ne 'unknown') {
+    $cands += (Join-Path $tools "node-$($i.NodePin)-win32-x64/node.exe")
   }
-  if ($fixed) { Ok ("receipt 路径改写 {0} 项 → 本机安装目录（让 hermes update 认得出这批产物）" -f $fixed) }
+  $cands += @(Get-ChildItem $tools -Directory -Filter 'node-*-win32-*' -ErrorAction SilentlyContinue |
+              Sort-Object Name -Descending | ForEach-Object { Join-Path $_.FullName 'node.exe' })
+  foreach ($c in $cands) { if ($c -and (Test-Path $c)) { return $c } }
+  $cmd = Get-Command node -ErrorAction SilentlyContinue
+  if ($cmd) { return $cmd.Source }
+  return $null
+}
+
+function Invoke-SignReceipts($i) {
+  $signer = Join-Path $PSScriptRoot 'sign-receipts.mjs'
+  if (-not (Test-Path $signer)) {
+    Warn '  找不到 sign-receipts.mjs（脚本目录里应有一份）→ 跳过重签，build 段会照常本地编译'
+    return
+  }
+  $node = Get-NodeExe $i
+  if (-not $node) {
+    Warn '  找不到目标机 node → 跳过 receipt 重签，build 段会照常本地编译'
+    return
+  }
+  Say ("  用 {0} 重签 receipt..." -f (Split-Path $node -Leaf)) 'DarkGray'
+  & $node $signer $i.Dir
+  if ($LASTEXITCODE -ne 0) {
+    Warn '  receipt 重签有失败项：build 段可能仍会本地编译（产物本身没问题）'
+  }
 }
 
 function Invoke-Rollback($i) {
@@ -522,7 +524,7 @@ if (-not $Yes) {
 $bk = Backup-Current $i
 try {
   Apply-Payload $root $i
-  Repair-ReceiptPaths $i
+  Invoke-SignReceipts $i
   Ok '覆盖完成'
 } catch {
   Warn ("覆盖失败：{0}" -f $_.Exception.Message)

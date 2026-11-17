@@ -350,44 +350,25 @@ apply_payload() {
 # CI 烘焙的 receipt 里 prepared[].path 记的是构建机的绝对路径（…/src/…）。
 # freshness.mjs 拿这些 path 重算内容 hash 并逐字段比对，路径在目标机不存在就判「产物过期」→ 桌面壳白编一遍。
 # hash 是内容 hash（与路径无关），所以只把 "/src/" 之前的前缀换成本机安装目录即可。
-repair_receipt_paths() {
-  python3 - "$INSTALL_DIR" <<'PY'
-import json, os, re, sys
-root = sys.argv[1]
-fixed = 0
-for rel in ("apps/desktop/dist/hermes-build.json",
-            "hermes_cli/web_dist/hermes-build.json",
-            "ui-tui/dist/hermes-build.json"):
-    p = os.path.join(root, rel)
-    if not os.path.isfile(p):
-        continue
-    with open(p, encoding="utf-8") as f:
-        raw = f.read()
-    try:
-        doc = json.loads(raw)
-    except Exception:
-        continue
-    prepared = (doc.get("inputs") or {}).get("prepared") or []
-    text = raw
-    for item in prepared:
-        old = item.get("path") or ""
-        # CI 的 path 值里反斜杠是成对出现的（D:\\a\\...），按分隔符切最稳，别跟正则转义较劲
-        parts = [x for x in re.split(r"[\\/]+", old) if x]
-        if "src" not in parts:
-            continue
-        idx = len(parts) - 1 - parts[::-1].index("src")
-        if idx >= len(parts) - 1:
-            continue
-        new = os.path.join(root, *parts[idx + 1:])
-        if new == old:
-            continue
-        text = text.replace(json.dumps(old)[1:-1], json.dumps(new)[1:-1])
-        fixed += 1
-    if text != raw:
-        with open(p, "w", encoding="utf-8", newline="") as f:
-            f.write(text)
-print(fixed)
-PY
+# CI 的 receipt 里 hash 是构建机算的：sourceHash 覆盖 .npmrc/源码树（构建过程自己会改 .npmrc），
+# prepared.nativeDeps 甚至与 CI 自己上传的目录都对不上 —— 跨机器永远为 false，桌面壳会白编一遍。
+# 所以覆盖后按本机源码树重签（hash 全部本地实算）；安全性由前面的 manifest.sha / 烘焙 stamp / HEAD 三重校验兜着。
+find_node() {
+  local c
+  for c in "$HERMES_HOME"/tools/node-*-linux-*/bin/node; do
+    [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  command -v node 2>/dev/null || true
+}
+
+invoke_sign_receipts() {
+  local signer node
+  signer="$(dirname "$(readlink -f "$0")")/sign-receipts.mjs"
+  [ -f "$signer" ] || { warn '  找不到 sign-receipts.mjs → 跳过重签，build 段会照常本地编译'; return 0; }
+  node=$(find_node)
+  [ -n "${node:-}" ] || { warn '  找不到 node → 跳过 receipt 重签，build 段会照常本地编译'; return 0; }
+  c '0;90' "  用 $(basename "$node") 重签 receipt..."
+  "$node" "$signer" "$INSTALL_DIR" || warn '  receipt 重签有失败项：build 段可能仍会本地编译（产物本身没问题）'
 }
 
 rollback() {
@@ -494,8 +475,7 @@ backup
 if ! apply_payload; then
   warn '覆盖失败，正在回滚...'; rollback; die '已回滚到覆盖前状态'
 fi
-n=$(repair_receipt_paths 2>/dev/null || echo 0)
-[ "${n:-0}" != "0" ] && ok "receipt 路径改写 $n 项 → 本机安装目录（让 hermes update 认得出这批产物）"
+invoke_sign_receipts
 ok '覆盖完成'
 
 if [ "$SKIP_UPDATE" = 0 ]; then
