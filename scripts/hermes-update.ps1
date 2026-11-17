@@ -336,6 +336,7 @@ function Backup-Current($i) {
   New-Item -ItemType Directory -Force -Path $bk | Out-Null
   $moved = 0
   foreach ($rel in @('apps/desktop/release/win-unpacked', 'apps/desktop/dist', 'apps/desktop/build/install-stamp.json',
+                     'apps/desktop/build/native-deps', 'apps/desktop/build/native-deps.prepared.json',
                      'hermes_cli/web_dist', 'ui-tui/dist')) {
     $src = Join-Path $i.Dir $rel
     if (Test-Path $src) {
@@ -353,6 +354,8 @@ function Apply-Payload($root, $i) {
     @{ Src = 'apps/desktop/release/win-unpacked'; Dst = 'apps/desktop/release/win-unpacked' },
     @{ Src = 'apps/desktop/dist';                 Dst = 'apps/desktop/dist' },
     @{ Src = 'apps/desktop/build/install-stamp.json'; Dst = 'apps/desktop/build/install-stamp.json' },
+    @{ Src = 'apps/desktop/build/native-deps';    Dst = 'apps/desktop/build/native-deps' },
+    @{ Src = 'apps/desktop/build/native-deps.prepared.json'; Dst = 'apps/desktop/build/native-deps.prepared.json' },
     @{ Src = 'hermes_cli/web_dist';               Dst = 'hermes_cli/web_dist' },
     @{ Src = 'ui-tui/dist';                       Dst = 'ui-tui/dist' }
   )
@@ -366,12 +369,47 @@ function Apply-Payload($root, $i) {
   }
 }
 
+# CI 烘焙的 receipt 里 prepared[].path 记的是构建机的绝对路径（D:\a\<repo>\<repo>\src\...）。
+# freshness.mjs 会拿这些 path 重算内容 hash 并逐字段比对，路径在目标机不存在就判「产物过期」→ 桌面壳白编一遍。
+# hash 是内容 hash（与路径无关，实测 icons/stamp 改写后 hash 完全一致），所以只把 "…\src\" 之前的前缀
+# 换成本机安装目录即可。必须写成无 BOM 的 UTF-8：带 BOM 会让 node 的 JSON.parse 直接抛错。
+function Repair-ReceiptPaths($i) {
+  $fixed = 0
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  foreach ($rel in @('apps/desktop/dist/hermes-build.json', 'hermes_cli/web_dist/hermes-build.json',
+                     'ui-tui/dist/hermes-build.json')) {
+    $p = Join-Path $i.Dir $rel
+    if (-not (Test-Path $p)) { continue }
+    $raw = [IO.File]::ReadAllText($p)
+    try { $j = $raw | ConvertFrom-Json } catch { continue }
+    if (-not $j.inputs -or -not $j.inputs.prepared) { continue }
+    $changed = $false
+    foreach ($item in $j.inputs.prepared) {
+      $old = [string]$item.path
+      if (-not $old) { continue }
+      # CI 的 path 值里反斜杠成对出现（D:\\a\\...），按分隔符切最稳
+      $parts = @($old -split '[\\/]+' | Where-Object { $_ })
+      $idx = -1
+      for ($k = 0; $k -lt $parts.Count; $k++) { if ($parts[$k] -eq 'src') { $idx = $k } }
+      if ($idx -lt 0 -or $idx -ge ($parts.Count - 1)) { continue }
+      $relpath = ($parts[($idx + 1)..($parts.Count - 1)]) -join '\'
+      $new = Join-Path $i.Dir $relpath
+      if ($new -eq $old) { continue }
+      $raw = $raw.Replace($old.Replace('\', '\\'), $new.Replace('\', '\\'))
+      $changed = $true; $fixed++
+    }
+    if ($changed) { [IO.File]::WriteAllText($p, $raw, $utf8NoBom) }
+  }
+  if ($fixed) { Ok ("receipt 路径改写 {0} 项 → 本机安装目录（让 hermes update 认得出这批产物）" -f $fixed) }
+}
+
 function Invoke-Rollback($i) {
   $bks = Get-ChildItem $i.Dir -Directory -Filter '.hermes-prebuild-backup-*' | Sort-Object Name -Descending
   if (-not $bks) { Fail '没有可回滚的备份' }
   $bk = $bks[0].FullName
   Say ("回滚到 {0}" -f $bk) 'Yellow'
   foreach ($rel in @('apps/desktop/release/win-unpacked', 'apps/desktop/dist', 'apps/desktop/build/install-stamp.json',
+                     'apps/desktop/build/native-deps', 'apps/desktop/build/native-deps.prepared.json',
                      'hermes_cli/web_dist', 'ui-tui/dist')) {
     $src = Join-Path $bk $rel
     if (-not (Test-Path $src)) { continue }
@@ -484,6 +522,7 @@ if (-not $Yes) {
 $bk = Backup-Current $i
 try {
   Apply-Payload $root $i
+  Repair-ReceiptPaths $i
   Ok '覆盖完成'
 } catch {
   Warn ("覆盖失败：{0}" -f $_.Exception.Message)
@@ -494,6 +533,15 @@ try {
 
 if (-not $SkipUpdate) {
   Say ''
+  # stable 渠道解析要 git ls-remote；Hermes 内部把 core.sshCommand 钉成 `ssh -o BatchMode=yes`，
+  # 会丢掉全局配置里的 -i <key>，origin 是 SSH 时必然 exit 128。GIT_SSH_COMMAND 优先级更高。
+  if (-not $env:GIT_SSH_COMMAND) {
+    $sc = (& git config --get core.sshCommand 2>$null)
+    if ($sc) {
+      $env:GIT_SSH_COMMAND = "$sc -o BatchMode=yes"
+      Say ("  已把 core.sshCommand 传给 hermes update：{0}" -f $env:GIT_SSH_COMMAND) 'DarkGray'
+    }
+  }
   Say '── 运行 hermes update（build 段应命中 receipt 直接跳过）────────────' 'Cyan'
   $cli = if ($i.Cli) { $i.Cli } else { 'hermes' }
   & $cli update

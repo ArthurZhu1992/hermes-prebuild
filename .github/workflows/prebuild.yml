@@ -4,7 +4,7 @@ name: Hermes prebuild
 # 产出"已编译目录树"的 zip artifact，供各机器覆盖后让 hermes update 跳过本地编译。
 #
 # 产物（artifact 名 = hermes-<os>-<arch>-<sha12>）：
-#   hermes-win-x64-<sha12>      win-unpacked + apps/desktop/dist + build/install-stamp.json + web_dist + ui-tui/dist
+#   hermes-win-x64-<sha12>      win-unpacked + apps/desktop/dist + build/{install-stamp.json,native-deps} + web_dist + ui-tui/dist
 #   hermes-linux-x64-<sha12>    同上，linux-unpacked
 #   hermes-cli-linux-<sha12>    只含 web_dist + ui-tui/dist（纯 CLI 机器用，~2.4 MB）
 #   hermes-cli-win-x64-<sha12>  同上，manifest.platform=win32（Windows 纯 CLI 机器）
@@ -218,6 +218,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path $dst/apps/desktop/release,$dst/apps/desktop/build,$dst/apps/desktop/dist,$dst/hermes_cli/web_dist,$dst/ui-tui/dist | Out-Null
           Copy-Item src/apps/desktop/release/win-unpacked -Destination $dst/apps/desktop/release -Recurse
           Copy-Item src/apps/desktop/build/install-stamp.json -Destination $dst/apps/desktop/build
+          # native-deps 必须一起带上：dist/hermes-build.json 的 prepared.nativeDeps 会按内容 hash 校验它，
+          # 缺了这个目录，本地 freshness 判定必然为 false，桌面壳会白编一遍（实测多花 237 s）。
+          if (Test-Path src/apps/desktop/build/native-deps) {
+            Copy-Item src/apps/desktop/build/native-deps -Destination $dst/apps/desktop/build -Recurse
+          }
+          if (Test-Path src/apps/desktop/build/native-deps.prepared.json) {
+            Copy-Item src/apps/desktop/build/native-deps.prepared.json -Destination $dst/apps/desktop/build
+          }
           Copy-Item src/apps/desktop/dist/* -Destination $dst/apps/desktop/dist -Recurse
           Copy-Item src/hermes_cli/web_dist/* -Destination $dst/hermes_cli/web_dist -Recurse
           Copy-Item src/ui-tui/dist/* -Destination $dst/ui-tui/dist -Recurse
@@ -305,6 +313,13 @@ jobs:
           mkdir -p ../payload-full/apps/desktop/release ../payload-full/apps/desktop/build ../payload-full/apps/desktop/dist ../payload-full/hermes_cli/web_dist ../payload-full/ui-tui/dist
           cp -a apps/desktop/release/linux-unpacked ../payload-full/apps/desktop/release/
           cp -a apps/desktop/build/install-stamp.json ../payload-full/apps/desktop/build/
+          # native-deps 是 receipt 里 prepared.nativeDeps 的校验对象，不带它本地必然判「过期」
+          if [ -d apps/desktop/build/native-deps ]; then
+            cp -a apps/desktop/build/native-deps ../payload-full/apps/desktop/build/
+          fi
+          if [ -f apps/desktop/build/native-deps.prepared.json ]; then
+            cp -a apps/desktop/build/native-deps.prepared.json ../payload-full/apps/desktop/build/
+          fi
           cp -a apps/desktop/dist/. ../payload-full/apps/desktop/dist/
           cp -a hermes_cli/web_dist/. ../payload-full/hermes_cli/web_dist/
           cp -a ui-tui/dist/. ../payload-full/ui-tui/dist/

@@ -322,7 +322,9 @@ verify() {
 }
 
 # ─── 4. 备份 / 覆盖 / 回滚 ─────────────────────────────────────────────────
-ITEMS=(apps/desktop/release/linux-unpacked apps/desktop/dist apps/desktop/build/install-stamp.json hermes_cli/web_dist ui-tui/dist)
+ITEMS=(apps/desktop/release/linux-unpacked apps/desktop/dist apps/desktop/build/install-stamp.json \
+       apps/desktop/build/native-deps apps/desktop/build/native-deps.prepared.json \
+       hermes_cli/web_dist ui-tui/dist)
 
 backup() {
   BK="$INSTALL_DIR/.hermes-prebuild-backup-$STAMP_TS"
@@ -343,6 +345,49 @@ apply_payload() {
     cp -a "$ROOT/$rel" "$INSTALL_DIR/$rel" || return 1
     ok "覆盖 $rel"
   done
+}
+
+# CI 烘焙的 receipt 里 prepared[].path 记的是构建机的绝对路径（…/src/…）。
+# freshness.mjs 拿这些 path 重算内容 hash 并逐字段比对，路径在目标机不存在就判「产物过期」→ 桌面壳白编一遍。
+# hash 是内容 hash（与路径无关），所以只把 "/src/" 之前的前缀换成本机安装目录即可。
+repair_receipt_paths() {
+  python3 - "$INSTALL_DIR" <<'PY'
+import json, os, re, sys
+root = sys.argv[1]
+fixed = 0
+for rel in ("apps/desktop/dist/hermes-build.json",
+            "hermes_cli/web_dist/hermes-build.json",
+            "ui-tui/dist/hermes-build.json"):
+    p = os.path.join(root, rel)
+    if not os.path.isfile(p):
+        continue
+    with open(p, encoding="utf-8") as f:
+        raw = f.read()
+    try:
+        doc = json.loads(raw)
+    except Exception:
+        continue
+    prepared = (doc.get("inputs") or {}).get("prepared") or []
+    text = raw
+    for item in prepared:
+        old = item.get("path") or ""
+        # CI 的 path 值里反斜杠是成对出现的（D:\\a\\...），按分隔符切最稳，别跟正则转义较劲
+        parts = [x for x in re.split(r"[\\/]+", old) if x]
+        if "src" not in parts:
+            continue
+        idx = len(parts) - 1 - parts[::-1].index("src")
+        if idx >= len(parts) - 1:
+            continue
+        new = os.path.join(root, *parts[idx + 1:])
+        if new == old:
+            continue
+        text = text.replace(json.dumps(old)[1:-1], json.dumps(new)[1:-1])
+        fixed += 1
+    if text != raw:
+        with open(p, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+print(fixed)
+PY
 }
 
 rollback() {
@@ -449,10 +494,22 @@ backup
 if ! apply_payload; then
   warn '覆盖失败，正在回滚...'; rollback; die '已回滚到覆盖前状态'
 fi
+n=$(repair_receipt_paths 2>/dev/null || echo 0)
+[ "${n:-0}" != "0" ] && ok "receipt 路径改写 $n 项 → 本机安装目录（让 hermes update 认得出这批产物）"
 ok '覆盖完成'
 
 if [ "$SKIP_UPDATE" = 0 ]; then
-  head_ ''; head_ '── 运行 hermes update（build 段应命中 receipt 直接跳过）────────────'
+  head_ ''
+  # stable 渠道解析要 git ls-remote；Hermes 内部把 core.sshCommand 钉成 `ssh -o BatchMode=yes`，
+  # 会丢掉全局配置里的 -i <key>，origin 是 SSH 时必然 exit 128。GIT_SSH_COMMAND 优先级更高。
+  if [ -z "${GIT_SSH_COMMAND:-}" ] && command -v git >/dev/null 2>&1; then
+    sc=$(git config --get core.sshCommand 2>/dev/null || true)
+    if [ -n "${sc:-}" ]; then
+      export GIT_SSH_COMMAND="$sc -o BatchMode=yes"
+      c '0;90' "  已把 core.sshCommand 传给 hermes update：$GIT_SSH_COMMAND"
+    fi
+  fi
+  head_ '── 运行 hermes update（build 段应命中 receipt 直接跳过）────────────'
   cli=$(jget cli); [ -n "$cli" ] || cli=hermes
   "$cli" update || warn "hermes update 退出码非 0；产物备份在 $BK，需要时 --rollback"
 else
