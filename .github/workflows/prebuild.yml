@@ -87,6 +87,7 @@ jobs:
           case "$have_stable" in ''|null) have_stable="";; esac
           echo "本仓库 $tag release：${have_stable:-不存在}"
 
+          skip=false
           if [ -n "${INPUT_REF:-}" ]; then
             ref="$INPUT_REF"; sha=$(gh api "repos/$UP/commits/$ref" --jq .sha)
             reason="手动指定 ref=$ref"
@@ -97,12 +98,16 @@ jobs:
             ref="$tag"; sha="$tag_sha"
             reason="stable 新版 / 强制重建：$tag（$last_tag -> $tag_sha）"
           else
-            ref="$tag"; sha="$tag_sha"
-            reason="上游最新正式版 $tag 已有产物，跳过（只构建稳定版）"
+            # 已有产物且 state 记的就是这个 sha —— 必须在这里就定死「不编」，
+            # 否则下面「是 tag 就 changed=true」会把早退覆盖掉，schedule 每天白编一遍同版本
+            ref="$tag"; sha="$tag_sha"; skip=true
+            reason="上游最新正式版 $tag 已有产物（state 同 sha），早退（只构建稳定版）"
           fi
 
-          # 只认上游正式版 tag：main / 分支 / 裸 sha 一律不编，changed=false 让下游 job 直接跳过
-          if [ "$sha" = "$tag_sha" ] || [[ "$ref" == v[0-9]* ]]; then
+          # 只认上游正式版 tag：main / 分支 / 裸 sha 一律不编；已有产物同样早退
+          if [ "$skip" = true ]; then
+            changed=false
+          elif [ "$sha" = "$tag_sha" ] || [[ "$ref" == v[0-9]* ]]; then
             changed=true
           else
             changed=false
