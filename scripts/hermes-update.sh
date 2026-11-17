@@ -216,10 +216,8 @@ find_artifact() {
 }
 
 # release 通道：资产名 = <artifact 名>.zip
-# 发布结构（两条线分开，Releases 列表才看得懂）：
-#   stable 线   tag = 版本号本身（v0.23.1）  永久保留，回退锚点
-#   main   线   tag = main，标题带版本号     滚动，只留最近 2 个 SHA
-#   prebuild   旧滚动 release，迁移期兜底
+# 发布结构：只有稳定版一条线 —— tag = 版本号本身（v0.23.1），永久保留，回退锚点
+#           main / 分支的滚动产物已停出，main 渠道没有预编译可命中
 release_asset() {   # <release-tag> <asset-name>  →  "id size url"
   api_get "repos/$BUILDER_REPO/releases/tags/$1" \
     ".assets[] | select(.name==\"$2\") | \"\(.id) \(.size) \(.browser_download_url)\"" 2>/dev/null
@@ -228,7 +226,10 @@ release_asset() {   # <release-tag> <asset-name>  →  "id size url"
 find_release_asset() {
   local want_zip="$want.zip" line slug slugs=()
   if [ -n "${T_REF:-}" ]; then case "$T_REF" in v*) slugs+=("$T_REF");; esac; fi
-  slugs+=(main prebuild)
+  if [ ${#slugs[@]} -eq 0 ]; then
+    say "  目标 ref「${T_REF:-?}」不是正式版 tag —— 预编译只出稳定版，这条渠道没有产物（改用 stable 渠道或让 update 本地编译）"
+    return 1
+  fi
   for slug in "${slugs[@]}"; do
     if line=$(release_asset "$slug" "$want_zip") && [ -n "${line:-}" ]; then
       ART_ID=${line%% *}; line=${line#* }
@@ -436,7 +437,7 @@ fi
 ok "找到产物 $ART_NAME（$((ART_SIZE/1024/1024)) MB，通道=$PAYLOAD_KIND）"
 download
 verify || { warn '产物校验不过 → 不覆盖，保持现状（下次 hermes update 会本地全量编译）'; exit 1; }
-# 版本号从产物自带的 manifest.json 读：stable 线每个版本一份，main 线每批一份，不依赖滚动的 latest.json
+# 版本号从产物自带的 manifest.json 读：一条 release 一份，不依赖任何滚动覆盖的文件
 ver=$(python3 -c "import json;print(json.load(open('$ROOT/manifest.json')).get('version',''))" 2>/dev/null || true)
 [ -n "${ver:-}" ] && ok "对应版本：$ver" 
 [ "$DRY_RUN" = 1 ] && { head_ ''; c '0;36' '[DryRun] 检查全部通过，未改动任何文件'; exit 0; }

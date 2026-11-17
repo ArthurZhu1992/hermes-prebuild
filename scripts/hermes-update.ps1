@@ -221,14 +221,17 @@ function Find-Artifact($i, $short) {
 }
 
 # release 通道：资产名 = <artifact 名>.zip
-# 发布结构：stable 线 tag = 版本号本身（v0.23.1，永久）；main 线 tag = main（滚动）；
-#           prebuild 为旧滚动 release，迁移期兜底。
+# 发布结构：只有稳定版一条线 —— tag = 版本号本身（v0.23.1），永久保留，回退锚点。
+#           main / 分支的滚动产物已停出，main 渠道没有预编译可命中。
 function Find-ReleaseAsset($i, $short) {
   $kind = if ($i.Desktop) { "hermes-win-$Arch-$short" } else { "hermes-cli-win-$Arch-$short" }
   $zipName = "$kind.zip"
   $slugs = @()
   if ($target.Ref -match '^v') { $slugs += $target.Ref }
-  $slugs += @('main', 'prebuild')
+  if ($slugs.Count -eq 0) {
+    Say ("  目标 ref「{0}」不是正式版 tag —— 预编译只出稳定版，这条渠道没有产物（用 --set-channel stable 或让 update 本地编译）" -f $target.Ref)
+    return $null
+  }
   foreach ($slug in $slugs) {
     try { $rel = Api-Get "repos/$BuilderRepo/releases/tags/$slug" } catch { continue }
     $a = @($rel.assets | Where-Object { $_.name -eq $zipName })[0]
@@ -464,7 +467,7 @@ if (-not (Verify-Payload $root $target $i)) {
   Say '  产物校验不过 → 不覆盖，保持现状（下次 hermes update 会本地全量编译）' 'Yellow'
   return
 }
-# 版本号从产物自带的 manifest.json 读，不再依赖滚动的 latest.json
+# 版本号从产物自带的 manifest.json 读：一条 release 一份，不依赖任何滚动覆盖的文件
 try {
   $m = Get-Content (Join-Path $root 'manifest.json') -Raw | ConvertFrom-Json
   if ($m.version) { Ok ("对应版本：{0}" -f $m.version) }

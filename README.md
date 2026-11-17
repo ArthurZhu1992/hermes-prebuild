@@ -41,32 +41,27 @@ powershell -ExecutionPolicy Bypass -File .\hermes-update.ps1 -Ref v0.23.1 -Yes
 | `hermes-cli-linux-<sha12>` | 只有 `hermes_cli/web_dist` + `ui-tui/dist`（纯 CLI 机器，无 Electron） | ~2.4 MB |
 | `hermes-cli-win-x64-<sha12>` | 同上，`manifest.platform=win32`（Windows 纯 CLI 机器） | ~2.4 MB |
 
-同一批产物还会再发一份到 **Releases** —— **一个版本一条 release，跟上游 releases 页同一个形状**：
+同一批产物还会再发一份到 **Releases** —— **一个上游正式版一条 release**：
 
-| 线 | release tag | 标题 | 保留策略 |
+| 来源 | release tag | 标题 | 保留策略 |
 |---|---|---|---|
-| stable | `v0.23.1`（直接沿用上游 tag） | `预编译产物 · v0.23.1` | **永久**，回退锚点 |
-| main | `main` | `预编译产物 · main · v0.23.1.7919` | 滚动，只留最近 2 个 SHA |
-| 任意上游 tag（`--ref v0.22.7`） | `v0.22.7` | `预编译产物 · v0.22.7` | **永久**，每个正式版都能回退 |
-| 任意分支（`--ref mybranch`） | `main` | `预编译产物 · main · v0.23.1-mybranch.gb9cb7a2` | 滚动，只留最近 2 个 SHA |
+| 上游最新 release tag（自动） | `v0.23.1` | `v0.23.1` | **永久**，回退锚点 |
+| 手动指定历史 tag（`--ref v0.22.7`） | `v0.22.7` | `v0.22.7` | **永久**，每个正式版都能回退 |
 
-版本号只出上游语义版本，不掺 git describe 尾巴：
+**只构建上游正式版（release tag）。** `main` 与任意分支/裸 sha 不再出产物：
+dispatch 给了非 tag ref，resolve 会直接跳过、什么都不编；`hermes-update.sh -Ref main` 也找不到东西，
+只会在本机走 `hermes update` 的本地全量编译。
 
-```
-v0.23.1                     ← sha == 上游最新 release tag 的 sha（stable 线）
-v0.23.1.7919                ← main：距 v0.23.1 第 7919 个提交（第四段，天然可排序）
-v0.23.1-mybranch.gb9cb7a2   ← 任意 dispatch ref
-```
+版本号只出上游语义版本，等于上游 release tag，不掺 git describe 尾巴（不会出现 `v0.23.1.7919` 或
+`v0.23.1+7919.gb9cb7a2`）。
 
-不会再出现 `v0.23.1+7919.gb9cb7a2` 这种形式。
-
-每条 release 自带一份 `manifest.json`（`{version, ref, sha, base, stable, built_at, assets[]}`），
-脚本从产物里的这份文件读版本号，不依赖滚动覆盖的 `latest.json`；`latest.json` 只服务 `main` 那条线。
+每条 release 自带一份 `manifest.json`（`{version, ref, sha, base, persisted, built_at, assets[]}`），
+脚本从这份文件读版本号。
 
 | 通道 | 位置 | 有效期 | 下载是否需要登录 | 实际走哪个域 |
 |---|---|---|---|---|
 | artifact | Actions 产物 | 7 天 | **需要** | Azure blob（国内常可达） |
-| release | 一个版本一条 release，资产名带 sha12 | **永久**（main 线滚动） | **不需要** | api.github.com → release-assets.githubusercontent.com |
+| release | 一个版本一条 release，资产名带 sha12 | **永久** | **不需要** | api.github.com → release-assets.githubusercontent.com |
 
 脚本用 `--source` 选通道（PS 是 `-Source`）：
 
@@ -87,22 +82,19 @@ v0.23.1-mybranch.gb9cb7a2   ← 任意 dispatch ref
 
 | 方式 | 说明 |
 |---|---|
-| `schedule`（每天 03:17 UTC） | 先补 stable 缺口，再看 main 有没有新 commit；两者都没变就 10 秒早退 |
+| `schedule`（每天 03:17 UTC） | 查上游最新 release tag，本仓库 `state/last-built.json` 里还没有这个 tag 的产物才构建；否则 10 秒早退 |
 | `push`（main） | 构建器自身（workflow / scripts）改动推上来就自动跑一次检查 |
-| `workflow_dispatch` | 手动指定任意 `ref`（分支 / tag / SHA），需要 token |
+| `workflow_dispatch` | 手动指定上游 tag（如 `v0.22.7`）补历史版本；给非 tag ref 会被跳过 |
 
-优先级：**上游最新正式版在本仓库还没有 release** → 先编它（`v0.23.1`），跑完自动 dispatch 一次 `main`
-（`GITHUB_TOKEN` 允许触发 `workflow_dispatch`），所以一次 push 就能把两条线都补齐。
-
-`main` release 至少 3 个 zip 就位后，旧的单一滚动 release `prebuild` 会被自动删除 —— 迁移不需要手动操作。
-`scripts/migrate-release-layout.sh` 只是手动兜底（CI 已自动做完）。
+**只编稳定版**：上游一发新版，下一次 schedule 就会自动出包（`v0.24.0` 这种），一条 release 永久保留。
+`main` / 分支 / 裸 sha 不再出产物，`--force` 也只是重编当前稳定版。
 
 ```bash
-# stable 发新版后给 Linux 桌面端出包
+# 上游发新版后手动出包（留空即取上游最新 release tag）
 gh workflow run prebuild.yml -R ArthurZhu1992/hermes-prebuild -f ref=v0.23.1
 
-# 强制重编（忽略 last-built 状态）
-gh workflow run prebuild.yml -R ArthurZhu1992/hermes-prebuild -f ref=main -f force=true
+# 强制重编稳定版（忽略 last-built 状态）
+gh workflow run prebuild.yml -R ArthurZhu1992/hermes-prebuild -f ref=v0.23.1 -f force=true
 ```
 
 构建用的是 `hermes update` 自己那套函数（`hermes_cli.source_build.build_update_products`），
