@@ -18,6 +18,9 @@ name: Hermes prebuild
 # 触发：
 #   schedule  每天 03:17 UTC 检查上游最新 release tag，本仓库还没有它的产物才构建
 #   dispatch  手动指定上游 tag（如 v0.22.7）补历史版本的产物
+#
+# 每条 release 除四个平台 zip + manifest.json 外，还带三个同步脚本：
+#   hermes-update.ps1 / hermes-update.sh / sign-receipts.mjs（后者的依赖关系：前两个调用它重签 receipt）
 
 on:
   workflow_dispatch:
@@ -433,6 +436,7 @@ jobs:
       REASON: ${{ needs.resolve.outputs.reason }}
       RELTAG: ${{ needs.resolve.outputs.reltag }}
     steps:
+      - uses: actions/checkout@v4          # 只为把 scripts/ 一起发进 release（用户不必再碰 raw.githubusercontent）
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -507,7 +511,11 @@ jobs:
           if ! gh release view "$REL_TAG" -R "$R" >/dev/null 2>&1; then
             gh release create "$REL_TAG" -R "$R" --title "$REL_TITLE" --notes '首次构建。' "${pre_flag[@]}"
           fi
-          gh release upload "$REL_TAG" dist/*.zip manifest.json -R "$R" --clobber
+          # 同步脚本随每个正式版一起发：国内 raw.githubusercontent 常年不通，release 直链快且匿名可下。
+          # sign-receipts.mjs 是 hermes-update.* 的依赖（覆盖后重签 receipt），必须同目录同批上传。
+          gh release upload "$REL_TAG" dist/*.zip manifest.json \
+            scripts/hermes-update.ps1 scripts/hermes-update.sh scripts/sign-receipts.mjs \
+            -R "$R" --clobber
           gh release edit "$REL_TAG" -R "$R" --title "$REL_TITLE" --notes-file notes.md
           echo "--- $REL_TAG 现有资产 ---"
           gh release view "$REL_TAG" -R "$R" --json assets --jq '.assets[]|"\(.name)\t\(.size)"'

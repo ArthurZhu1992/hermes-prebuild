@@ -13,22 +13,36 @@
 
 ## 0. 快速上手（30 秒）
 
+脚本**随每个正式版一起发在 release 里**，不用碰 `raw.githubusercontent.com`（国内常年不通）：
+
 ```bash
-# Linux
-curl -fsSLO https://raw.githubusercontent.com/ArthurZhu1992/hermes-prebuild/main/scripts/hermes-update.sh
+# Linux —— REL 换成你要的版本号即可
+REL=https://github.com/ArthurZhu1992/hermes-prebuild/releases/download/v0.23.2
+curl -fsSLO "$REL/hermes-update.sh"
+curl -fsSLO "$REL/sign-receipts.mjs"     # 覆盖后重签 receipt 要用，必须和 .sh 放同一个目录
 chmod +x hermes-update.sh
 ./hermes-update.sh --diagnose            # 只读：看本机安装状态
-./hermes-update.sh --ref v0.23.1 --yes   # 覆盖 + hermes update
+./hermes-update.sh --ref v0.23.2 --yes   # 覆盖 + hermes update
 ```
 
 ```powershell
 # Windows
-irm https://raw.githubusercontent.com/ArthurZhu1992/hermes-prebuild/main/scripts/hermes-update.ps1 -OutFile hermes-update.ps1
+$rel = 'https://github.com/ArthurZhu1992/hermes-prebuild/releases/download/v0.23.2'
+irm "$rel/hermes-update.ps1" -OutFile hermes-update.ps1
+irm "$rel/sign-receipts.mjs" -OutFile sign-receipts.mjs   # 同上，必须同目录
 powershell -ExecutionPolicy Bypass -File .\hermes-update.ps1 -Diagnose
-powershell -ExecutionPolicy Bypass -File .\hermes-update.ps1 -Ref v0.23.1 -Yes
+powershell -ExecutionPolicy Bypass -File .\hermes-update.ps1 -Ref v0.23.2 -Yes
+```
+
+脚本本身与版本无关（通用），每个 release 带一份**当时的**快照；想拿最新未发版的脚本才走 raw：
+
+```
+https://raw.githubusercontent.com/ArthurZhu1992/hermes-prebuild/main/scripts/hermes-update.ps1
+https://raw.githubusercontent.com/ArthurZhu1992/hermes-prebuild/main/scripts/sign-receipts.mjs
 ```
 
 不带参数运行 = 交互菜单。**不需要 GitHub token**：产物走 release 匿名直链，公开 API 匿名配额够用。
+
 
 ## 1. 产物
 
