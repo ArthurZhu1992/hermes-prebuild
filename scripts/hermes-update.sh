@@ -381,7 +381,8 @@ download_asset() {   # <release-tag> <asset-name> <out-file>
 }
 
 # partial clone 换版本要现拉缺失 blob（GitHub 一断就卡死）。release 带 hermes-src-<tag>.tar.gz，
-# 灌进本地对象库后可离线 checkout。必须 --no-filters，否则 core.autocrlf 会改写内容、hash 全错。
+# 灌进本地对象库后可离线 checkout。注意换行：仓库 `*.ps1 text eol=crlf`，归档给 CRLF、库存 LF，
+# 只加 --no-filters 会漏掉这批，所以下面两遍都要跑。
 ensure_source_tree() {
   local head tag asset tmp src
   head=$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || true)
@@ -404,9 +405,14 @@ ensure_source_tree() {
   [ -n "${src:-}" ] || src=$(find "$tmp" -maxdepth 1 -mindepth 1 -type d | head -1)
   [ -n "${src:-}" ] || { warn '  解包后找不到源码目录'; rm -rf "$tmp"; return 1; }
 
+  # 两遍都要跑，幂等：① 带 filter 让 .gitattributes 生效（`*.ps1 text eol=crlf` 这类规则会把
+  # 归档里的 CRLF 规范回库内的 LF）；② --no-filters 兜底（归档已是库内字节时同样能补）。
+  ( cd "$src" && find . \( -type f -o -type l \) -printf '%P\n' \
+      | git --git-dir="$INSTALL_DIR/.git" hash-object -w --stdin-paths >/dev/null ) \
+    || warn '  灌对象（带 filter）有失败项'
   ( cd "$src" && find . \( -type f -o -type l \) -printf '%P\n' \
       | git --git-dir="$INSTALL_DIR/.git" hash-object -w --no-filters --stdin-paths >/dev/null ) \
-    || warn '  灌对象时有失败项（继续尝试 checkout）'
+    || warn '  灌对象（--no-filters）有失败项'
 
   if git -C "$INSTALL_DIR" checkout -f "$T_SHA" >/dev/null 2>&1; then
     if [ "$(git -C "$INSTALL_DIR" rev-parse HEAD)" = "$T_SHA" ]; then

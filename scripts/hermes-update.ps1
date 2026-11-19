@@ -408,7 +408,8 @@ function Invoke-SignReceipts($i) {
 # 目标机多半是 partial clone（--filter=blob:none）：本地只有 commit/tree，换版本时 checkout 要现拉
 # 缺失 blob，GitHub 一断就卡死。release 里带 hermes-src-<tag>.tar.gz（上游源码快照），把内容灌进本地
 # 对象库即可离线 checkout —— blob hash 由内容决定，与 GitHub 那份必然一致。
-# 必须带 --no-filters：Windows 的 core.autocrlf 会改写内容，那样 hash 全错、白灌。
+# 注意换行：仓库里 `*.ps1 text eol=crlf`，归档给的是 CRLF、库里存 LF，所以必须让 .gitattributes
+# 生效（见下面两遍灌法），只加 --no-filters 会漏掉这批文件。
 function Ensure-SourceTree($i, $target) {
   $head = (& git -C $i.Dir rev-parse HEAD 2>$null | Out-String).Trim()
   if ($head -eq $target.Sha) { Ok '  源码树已在目标 commit（不用补 git 对象）'; return $true }
@@ -449,6 +450,11 @@ function Ensure-SourceTree($i, $target) {
     $list = Get-ChildItem -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
       $_.FullName.Substring($srcDir.FullName.Length + 1) -replace '\\', '/'
     }
+    # 两遍都要跑，幂等：
+    # ① 带 filter —— 让仓库 .gitattributes 生效。关键例子：`*.ps1 text eol=crlf` 会让归档里的 .ps1
+    #    是 CRLF，而库里存的是 LF；不转就得到 42 个对不上的 blob（实测）。
+    # ② --no-filters —— 兜底：归档本身已是库内字节（无 attributes 命中）时也能补上。
+    $list | & git --git-dir="$($i.Dir)/.git" hash-object -w --stdin-paths 2>$null | Out-Null
     $list | & git --git-dir="$($i.Dir)/.git" hash-object -w --no-filters --stdin-paths 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) { Warn '  灌对象时有失败项（继续尝试 checkout）' }
   } finally { Pop-Location }
