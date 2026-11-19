@@ -371,6 +371,52 @@ invoke_sign_receipts() {
   "$node" "$signer" "$INSTALL_DIR" || warn '  receipt 重签有失败项：build 段可能仍会本地编译（产物本身没问题）'
 }
 
+download_asset() {   # <release-tag> <asset-name> <out-file>
+  local url
+  url=$(api_get "repos/$BUILDER_REPO/releases/tags/$1" \
+        ".assets[] | select(.name==\"$2\") | .browser_download_url" 2>/dev/null | head -1)
+  [ -n "${url:-}" ] || return 1
+  curl -fsSL ${px[@]+"${px[@]}"} --retry 3 --retry-delay 2 --retry-all-errors \
+       --connect-timeout 20 -o "$3" "$url"
+}
+
+# partial clone 换版本要现拉缺失 blob（GitHub 一断就卡死）。release 带 hermes-src-<tag>.tar.gz，
+# 灌进本地对象库后可离线 checkout。必须 --no-filters，否则 core.autocrlf 会改写内容、hash 全错。
+ensure_source_tree() {
+  local head tag asset tmp src
+  head=$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || true)
+  if [ "$head" = "$T_SHA" ]; then ok '  源码树已在目标 commit（不用补 git 对象）'; return 0; fi
+  warn "  源码树 HEAD ${head:0:12} != 目标 ${T_SHA:0:12} → 需要补 git 对象"
+  case "${T_REF:-}" in
+    v*) ;;
+    *) warn '  目标不是正式版 tag，定位不到源码快照；这条路径请自己 git fetch/checkout'; return 1 ;;
+  esac
+  tag="$T_REF"; asset="hermes-src-$tag.tar.gz"
+  tmp=$(mktemp -d)
+  head_ '  取源码快照 '"$asset"' ...'
+  if ! download_asset "$tag" "$asset" "$tmp/$asset"; then
+    warn "  取不到 $asset（需要网络）；本次跳过源码补齐"
+    rm -rf "$tmp"; return 1
+  fi
+  ok "  已下载 $(( $(stat -c%s "$tmp/$asset") / 1048576 )) MB"
+  tar -xzf "$tmp/$asset" -C "$tmp" || { warn '  tar 解包失败'; rm -rf "$tmp"; return 1; }
+  src=$(find "$tmp" -maxdepth 1 -type d -name 'hermes-agent-*' | head -1)
+  [ -n "${src:-}" ] || src=$(find "$tmp" -maxdepth 1 -mindepth 1 -type d | head -1)
+  [ -n "${src:-}" ] || { warn '  解包后找不到源码目录'; rm -rf "$tmp"; return 1; }
+
+  ( cd "$src" && find . \( -type f -o -type l \) -printf '%P\n' \
+      | git --git-dir="$INSTALL_DIR/.git" hash-object -w --no-filters --stdin-paths >/dev/null ) \
+    || warn '  灌对象时有失败项（继续尝试 checkout）'
+
+  if git -C "$INSTALL_DIR" checkout -f "$T_SHA" >/dev/null 2>&1; then
+    if [ "$(git -C "$INSTALL_DIR" rev-parse HEAD)" = "$T_SHA" ]; then
+      rm -rf "$tmp"; ok '  源码树已对齐目标 commit（全程离线）'; return 0
+    fi
+  fi
+  warn '  checkout 没成功（多半还有 blob 缺失）；补法：git -C <安装目录> fetch origin '"$tag"
+  rm -rf "$tmp"; return 1
+}
+
 rollback() {
   local bk
   bk=$(ls -1d "$INSTALL_DIR"/.hermes-prebuild-backup-* 2>/dev/null | sort | tail -1)
@@ -470,6 +516,8 @@ ver=$(python3 -c "import json;print(json.load(open('$ROOT/manifest.json')).get('
 
 assert_closed
 if [ "$YES" = 0 ]; then read -r -p '确认覆盖？(y/N) ' go; [[ "$go" =~ ^[Yy] ]] || { warn '已取消'; exit 0; }; fi
+
+ensure_source_tree || warn '  源码树没对齐：产物照常覆盖，但 hermes update 的 git checkout 可能卡住（有网才行）'
 
 backup
 if ! apply_payload; then

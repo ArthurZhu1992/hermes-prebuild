@@ -405,6 +405,67 @@ function Invoke-SignReceipts($i) {
   }
 }
 
+# 目标机多半是 partial clone（--filter=blob:none）：本地只有 commit/tree，换版本时 checkout 要现拉
+# 缺失 blob，GitHub 一断就卡死。release 里带 hermes-src-<tag>.tar.gz（上游源码快照），把内容灌进本地
+# 对象库即可离线 checkout —— blob hash 由内容决定，与 GitHub 那份必然一致。
+# 必须带 --no-filters：Windows 的 core.autocrlf 会改写内容，那样 hash 全错、白灌。
+function Ensure-SourceTree($i, $target) {
+  $head = (& git -C $i.Dir rev-parse HEAD 2>$null | Out-String).Trim()
+  if ($head -eq $target.Sha) { Ok '  源码树已在目标 commit（不用补 git 对象）'; return $true }
+  Say ("  源码树 HEAD {0} != 目标 {1} → 需要补 git 对象" -f $head.Substring(0, [Math]::Min(12, $head.Length)), $target.Sha.Substring(0, 12)) 'Yellow'
+
+  if ($target.Ref -notmatch '^v') {
+    Warn '  目标不是正式版 tag，定位不到源码快照；这条路径请自己 git fetch/checkout'
+    return $false
+  }
+  $asset = "hermes-src-$($target.Ref).tar.gz"
+  $tmp = Join-Path $env:TEMP "hermes-src-$($target.Sha.Substring(0,12))"
+  Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+  $tar = Join-Path $tmp 'src.tar.gz'
+
+  Say ("  取源码快照 {0} ..." -f $asset) 'Cyan'
+  try {
+    $rel = Api-Get "repos/$BuilderRepo/releases/tags/$($target.Ref)"
+    $a = @($rel.assets | Where-Object { $_.name -eq $asset })[0]
+    if (-not $a) { throw "release $($target.Ref) 里没有 $asset" }
+    Invoke-WebRequest -Uri $a.browser_download_url -OutFile $tar -UseBasicParsing -TimeoutSec 900
+  } catch {
+    Warn ("  取不到源码快照：{0}" -f $_.Exception.Message)
+    Warn '  → 需要网络；或者手工把 tar.gz 放到本目录后加 -SourceDir 重跑（本次跳过源码补齐）'
+    return $false
+  }
+  Ok ("  已下载 {0:N0} MB" -f ((Get-Item $tar).Length / 1MB))
+
+  Say '  解包 ...' 'DarkGray'
+  & tar -xzf $tar -C $tmp
+  if ($LASTEXITCODE -ne 0) { Warn '  tar 解包失败'; return $false }
+  $srcDir = @(Get-ChildItem $tmp -Directory | Where-Object { $_.Name -like 'hermes-agent-*' })[0]
+  if (-not $srcDir) { Warn '  解包后找不到源码目录'; return $false }
+
+  Say '  灌对象（git hash-object -w --no-filters）...' 'DarkGray'
+  Push-Location $srcDir.FullName
+  try {
+    $list = Get-ChildItem -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
+      $_.FullName.Substring($srcDir.FullName.Length + 1) -replace '\\', '/'
+    }
+    $list | & git --git-dir="$($i.Dir)/.git" hash-object -w --no-filters --stdin-paths 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { Warn '  灌对象时有失败项（继续尝试 checkout）' }
+  } finally { Pop-Location }
+
+  Say ("  checkout -f {0} ..." -f $target.Sha.Substring(0, 12)) 'DarkGray'
+  & git -C $i.Dir checkout -f $target.Sha 2>&1 | Out-Null
+  $now = (& git -C $i.Dir rev-parse HEAD 2>$null | Out-String).Trim()
+  if ($now -ne $target.Sha) {
+    Warn ("  checkout 没成功（HEAD 仍是 {0}），多半还有 blob 缺失" -f $now)
+    Warn '  → 补的办法：git -C <安装目录> fetch origin <tag>，或把 tar 里的文件再灌一遍'
+    return $false
+  }
+  Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+  Ok '  源码树已对齐目标 commit（全程离线）'
+  $true
+}
+
 function Invoke-Rollback($i) {
   $bks = Get-ChildItem $i.Dir -Directory -Filter '.hermes-prebuild-backup-*' | Sort-Object Name -Descending
   if (-not $bks) { Fail '没有可回滚的备份' }
@@ -519,6 +580,11 @@ Assert-DesktopClosed $i
 if (-not $Yes) {
   $go = Read-Host '确认覆盖？(y/N)'
   if ($go -notmatch '^[Yy]') { Say '已取消' 'Yellow'; return }
+}
+
+$srcOk = Ensure-SourceTree $i $target
+if (-not $srcOk) {
+  Warn '  源码树没对齐：产物照常覆盖，但 hermes update 的 git checkout 可能卡住（有网才行）'
 }
 
 $bk = Backup-Current $i

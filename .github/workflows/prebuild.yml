@@ -363,6 +363,48 @@ jobs:
           retention-days: 7
           compression-level: 9
 
+  # ── 上游源码快照 ───────────────────────────────────────────────────────────
+  # 为什么需要它：目标机多半是 partial clone（--filter=blob:none），本地只有 commit/tree，
+  # 换版本时 git checkout 要现拉缺失 blob，GitHub 一断就卡死。带上这份源码，目标机就能
+  # 用 `git hash-object -w --no-filters` 把内容灌进自己的对象库（hash 由内容决定，必然一致），
+  # 然后 checkout 全程离线。90 MB 一份，win/linux/cli 共用，不按平台重复。
+  build-src:
+    needs: [resolve]
+    if: needs.resolve.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 取上游源码
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: src
+          fetch-depth: 1
+
+      - name: 打源码快照（前缀与 GitHub archive 一致）
+        run: |
+          set -euo pipefail
+          V='${{ needs.resolve.outputs.version }}'
+          PREFIX="hermes-agent-${V#v}"
+          mkdir -p out
+          # --exclude=.git：只留可 checkout 出来的内容；
+          # --transform 加上 hermes-agent-<ver>/ 前缀，与 GitHub archive 的目录名一致，
+          # 脚本解包后路径不用再猜。
+          tar -czf "out/hermes-src-${V}.tar.gz" \
+              --exclude='./.git' --exclude='.git' \
+              --transform "s|^\\./|${PREFIX}/|" \
+              -C src .
+          ls -la out/
+          tar -tzf "out/hermes-src-${V}.tar.gz" | wc -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermes-src-${{ needs.resolve.outputs.version }}
+          path: out
+          retention-days: 7
+          compression-level: 0        # 已经是 tar.gz，别再压一遍
+
   # ── 记录状态（同时解决 public 仓库 60 天无活动被禁用定时任务的问题）────────
   state:
     needs: [resolve, build-win, build-linux]
@@ -419,7 +461,7 @@ jobs:
   #              → 一条 tag=main 的滚动 release，标题带版本号，只留最近 2 个 SHA
   # 资产名始终带 sha12，脚本按 sha12 精确取件；版本号只负责「人看」与「回退锚点」。
   publish:
-    needs: [resolve, build-win, build-linux]
+    needs: [resolve, build-win, build-linux, build-src]
     if: needs.build-win.result == 'success' && needs.build-linux.result == 'success'
     runs-on: ubuntu-latest
     env:
@@ -440,6 +482,12 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: hermes-*-\${{ needs.resolve.outputs.short }}     # 只取四个平台产物，别把源码包也解到 dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: srcpkg
+          pattern: hermes-src-*
 
       - name: 打包成 release 资产（文件名带 sha12）
         run: |
@@ -480,6 +528,7 @@ jobs:
             done
             printf '\n构建时间 %s\n\n' "$(date -u '+%Y-%m-%d %H:%M UTC')"
             printf '**用法**：`./hermes-update.sh --ref %s`（Windows: `-Ref %s`）。release 通道匿名可下，不需要 token。\n\n' "$REF" "$REF"
+            printf '**源码快照**：`hermes-src-%s.tar.gz` 是上游源码快照。目标机是 partial clone（`[blob:none]`）时，脚本会用它把缺失的 git 对象灌进本地对象库（`git hash-object -w --no-filters`），再 `git checkout -f <sha>`，全程不需要 git 网络。\n\n' "$VERSION"
             printf '**上游 release**：<https://github.com/NousResearch/hermes-agent/releases/tag/%s>（commit `%s`）\n' \
               "$VERSION" "$SHA"
           } > notes.md
@@ -516,6 +565,12 @@ jobs:
           gh release upload "$REL_TAG" dist/*.zip manifest.json \
             scripts/hermes-update.ps1 scripts/hermes-update.sh scripts/sign-receipts.mjs \
             -R "$R" --clobber
+          # 源码快照：目标机是 partial clone 时靠它离线补 git 对象（详见 build-src job 注释）
+          if ls srcpkg/*.tar.gz >/dev/null 2>&1; then
+            gh release upload "$REL_TAG" srcpkg/*.tar.gz -R "$R" --clobber
+          else
+            echo "!! 没有源码包（build-src 未成功），跳过 —— 目标机只能走 git 网络补对象"
+          fi
           gh release edit "$REL_TAG" -R "$R" --title "$REL_TITLE" --notes-file notes.md
           echo "--- $REL_TAG 现有资产 ---"
           gh release view "$REL_TAG" -R "$R" --json assets --jq '.assets[]|"\(.name)\t\(.size)"'
