@@ -26,15 +26,19 @@ $r=iwr 'https://github.com/ArthurZhu1992/hermes-prebuild/releases/latest/downloa
 **Linux（bash）** —— 粘贴即用：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ArthurZhu1992/hermes-prebuild/main/scripts/hermes-bootstrap.sh | bash
+curl -fsSL https://github.com/ArthurZhu1992/hermes-prebuild/releases/latest/download/hermes-bootstrap.sh | bash
 ```
+
+> 用 release 直链而不是 `raw.githubusercontent.com`：raw 有 CDN 缓存（改完脚本可能几分钟内还拿到旧版），
+> release 资产是刚发的那一份。raw 能连的话也可以替换成
+> `https://raw.githubusercontent.com/ArthurZhu1992/hermes-prebuild/main/scripts/hermes-bootstrap.sh`。
 
 > `curl | bash` 会把管道接到 bash 的 stdin，菜单里的 `read` 就读不到键盘了 —— 引导脚本最后用
 > `</dev/tty` 把终端还回来，所以菜单照常可用。非交互用法把参数透传进去：
 >
 > ```bash
-> curl -fsSL .../hermes-bootstrap.sh | bash -s -- --check            # 零下载，只看有没有得升
-> curl -fsSL .../hermes-bootstrap.sh | bash -s -- --ref v0.23.3 --yes
+> curl -fsSL <上面那条 URL> | bash -s -- --check            # 零下载，只看有没有得升
+> curl -fsSL <上面那条 URL> | bash -s -- --ref v0.23.3 --yes
 > ```
 
 两边都能**手动**跑等价命令（已经下过脚本时）：
