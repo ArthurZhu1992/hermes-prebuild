@@ -513,24 +513,48 @@ function Ensure-SourceTree($i, $target) {
   Ok ("  已下载 {0:N0} MB" -f ((Get-Item $tar).Length / 1MB))
 
   Say '  解包 ...' 'DarkGray'
-  & tar -xzf $tar -C $tmp
-  if ($LASTEXITCODE -ne 0) { Warn '  tar 解包失败'; return $false }
+  $ErrorActionPreference = 'Continue'   # 原生程序写 stderr 不该终止脚本（配合 Stop 会抛 NativeCommandError）
+  & tar -xzf $tar -C $tmp 2>$null
+  $tarCode = $LASTEXITCODE
+  $ErrorActionPreference = 'Stop'
+  if ($tarCode -ne 0) { Warn '  tar 解包失败'; return $false }
   $srcDir = @(Get-ChildItem $tmp -Directory | Where-Object { $_.Name -like 'hermes-agent-*' })[0]
   if (-not $srcDir) { Warn '  解包后找不到源码目录'; return $false }
 
-  Say '  灌对象（git hash-object -w --no-filters）...' 'DarkGray'
+  Say '  灌对象（git hash-object -w）...' 'DarkGray'
   Push-Location $srcDir.FullName
   try {
-    $list = Get-ChildItem -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
+    $list = @(Get-ChildItem -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
       $_.FullName.Substring($srcDir.FullName.Length + 1) -replace '\\', '/'
+    })
+    Say ("    文件数 {0}" -f $list.Count) 'DarkGray'
+
+    # 关键：PowerShell 5.1 往原生程序灌管道会带 UTF-8 BOM，git 把 BOM 当成路径首字符 →
+    #   fatal: could not open '﻿.coderabbit.yaml'（实测踩过）。
+    # 所以写一份无 BOM 的清单文件，再用 Start-Process 重定向 stdin，完全不经过 PowerShell 管道。
+    $listFile = Join-Path $tmp 'filelist.txt'
+    [IO.File]::WriteAllLines($listFile, $list, (New-Object System.Text.UTF8Encoding($false)))
+
+    # 两遍，幂等：
+    # ① 带 filter —— 让 .gitattributes 生效（`*.ps1 text eol=crlf` 会把归档里的 CRLF 规范回库内 LF）
+    # ② --no-filters —— 兜底：归档已是库内字节时同样能补
+    $passes = @(
+      @{ Name = '带 filter';    Extra = @() },
+      @{ Name = '--no-filters'; Extra = @('--no-filters') }
+    )
+    foreach ($pass in $passes) {
+      $gitArgs = @("--git-dir=$($i.Dir)/.git", 'hash-object', '-w') + $pass.Extra + @('--stdin-paths')
+      $gp = Start-Process -FilePath 'git' -ArgumentList $gitArgs `
+              -RedirectStandardInput $listFile `
+              -RedirectStandardOutput (Join-Path $tmp 'hashes.out') `
+              -RedirectStandardError  (Join-Path $tmp 'hashes.err') `
+              -NoNewWindow -Wait -PassThru
+      if ($gp.ExitCode -ne 0) {
+        Warn ("    灌对象（{0}）退出码 {1}" -f $pass.Name, $gp.ExitCode)
+        $err = Get-Content (Join-Path $tmp 'hashes.err') -TotalCount 3 -ErrorAction SilentlyContinue
+        if ($err) { ($err | Select-Object -First 3) | ForEach-Object { Say ("      {0}" -f $_) 'DarkGray' } }
+      }
     }
-    # 两遍都要跑，幂等：
-    # ① 带 filter —— 让仓库 .gitattributes 生效。关键例子：`*.ps1 text eol=crlf` 会让归档里的 .ps1
-    #    是 CRLF，而库里存的是 LF；不转就得到 42 个对不上的 blob（实测）。
-    # ② --no-filters —— 兜底：归档本身已是库内字节（无 attributes 命中）时也能补上。
-    $list | & git --git-dir="$($i.Dir)/.git" hash-object -w --stdin-paths 2>$null | Out-Null
-    $list | & git --git-dir="$($i.Dir)/.git" hash-object -w --no-filters --stdin-paths 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) { Warn '  灌对象时有失败项（继续尝试 checkout）' }
   } finally { Pop-Location }
 
   Say ("  checkout -f {0} ..." -f $target.Sha.Substring(0, 12)) 'DarkGray'
