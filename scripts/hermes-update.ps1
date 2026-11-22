@@ -31,6 +31,7 @@ param(
   [switch]$SkipUpdate,
   [switch]$Rollback,
   [switch]$KillDesktop,                  # 桌面在跑时直接结束它（非交互/自动化用）
+  [switch]$SkipSource,                   # 跳过源码快照，交给 hermes update 自己 git fetch（需要能连 GitHub）
   [string]$Proxy,                        # 例：http://127.0.0.1:7890 / socks5://10.0.0.2:1080
   [ValidateSet('auto','artifact','release')][string]$Source = 'auto',   # 产物来源通道
   [ValidateSet('auto','desktop','cli')][string]$Flavor = 'auto',        # 装的是桌面版还是纯 CLI 版
@@ -718,9 +719,13 @@ if (-not $Yes) {
   if ($go -notmatch '^[Yy]') { Say '已取消' 'Yellow'; return }
 }
 
-$srcOk = Ensure-SourceTree $i $target
-if (-not $srcOk) {
-  Warn '  源码树没对齐：产物照常覆盖，但 hermes update 的 git checkout 可能卡住（有网才行）'
+if ($SkipSource) {
+  Say '  按 -SkipSource 跳过源码快照，交给 hermes update 自己 git fetch（需要能连 GitHub）' 'Yellow'
+} else {
+  $srcOk = Ensure-SourceTree $i $target
+  if (-not $srcOk) {
+    Warn '  源码树没对齐：产物照常覆盖，随后由 hermes update 自己 fetch（需要能连 GitHub）'
+  }
 }
 
 $bk = Backup-Current $i

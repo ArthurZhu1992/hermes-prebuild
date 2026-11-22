@@ -26,7 +26,7 @@ set -uo pipefail
 
 BUILDER_REPO="${BUILDER_REPO:-ArthurZhu1992/hermes-prebuild}"
 UPSTREAM="${UPSTREAM:-NousResearch/hermes-agent}"
-REF=""; DIAGNOSE=0; DRY_RUN=0; CHECK_ONLY=0; YES=0; SKIP_UPDATE=0; ROLLBACK=0; FLAVOR=auto; KILL_DESKTOP=0
+REF=""; DIAGNOSE=0; DRY_RUN=0; CHECK_ONLY=0; YES=0; SKIP_UPDATE=0; ROLLBACK=0; FLAVOR=auto; KILL_DESKTOP=0; SKIP_SOURCE=0
 PROXY_URL="${PROXY_URL:-}"; SKIP_PROXY=0
 SOURCE="${SOURCE:-auto}"   # auto | artifact | release
 STAMP_TS=$(date +%Y%m%d-%H%M%S)
@@ -43,6 +43,7 @@ while [ $# -gt 0 ]; do
     --diagnose) DIAGNOSE=1; shift;;
     --check) CHECK_ONLY=1; shift;;
     --kill-desktop) KILL_DESKTOP=1; shift;;
+    --skip-source) SKIP_SOURCE=1; shift;;
     --flavor) FLAVOR="$2"; shift 2;;
     --dry-run) DRY_RUN=1; shift;;
     -y|--yes) YES=1; shift;;
@@ -610,7 +611,11 @@ ver=$(python3 -c "import json;print(json.load(open('$ROOT/manifest.json')).get('
 
 if [ "$YES" = 0 ]; then read -r -p '确认覆盖？(y/N) ' go; [[ "$go" =~ ^[Yy] ]] || { warn '已取消'; exit 0; }; fi
 
-ensure_source_tree || warn '  源码树没对齐：产物照常覆盖，但 hermes update 的 git checkout 可能卡住（有网才行）'
+if [ "$SKIP_SOURCE" = 1 ]; then
+  warn '  按 --skip-source 跳过源码快照，交给 hermes update 自己 git fetch（需要能连 GitHub）'
+else
+  ensure_source_tree || warn '  源码树没对齐：产物照常覆盖，随后由 hermes update 自己 fetch（需要能连 GitHub）'
+fi
 
 backup
 if ! apply_payload; then
