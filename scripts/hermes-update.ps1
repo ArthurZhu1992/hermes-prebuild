@@ -16,7 +16,8 @@
   .\hermes-update.ps1                    # 交互菜单
   .\hermes-update.ps1 -Diagnose          # 只看状态，不改任何东西
   .\hermes-update.ps1 -Ref v0.23.1 -Yes  # 非交互：直接干到 v0.23.1
-  .\hermes-update.ps1 -DryRun            # 走完全部检查，不落地
+  .\hermes-update.ps1 -CheckOnly         # 只报有没有产物/差多少，不下载（菜单里的 1）
+  .\hermes-update.ps1 -DryRun            # 下载并走完全部校验，不落地
   .\hermes-update.ps1 -Rollback          # 回到上一次覆盖前的备份
 #>
 [CmdletBinding()]
@@ -24,6 +25,7 @@ param(
   [string]$Ref,
   [switch]$Diagnose,
   [switch]$DryRun,
+  [switch]$CheckOnly,                    # 只报告「有没有产物 / 差多少」，不下载、不落地
   [switch]$Yes,
   [switch]$SkipUpdate,
   [switch]$Rollback,
@@ -528,7 +530,7 @@ if ($Rollback) { Invoke-Rollback $i; return }
 if ($Diagnose -or (-not $Ref -and -not $Yes)) {
   Say ''
   Say '── 可选操作 ─────────────────────────────────────────────────────' 'Cyan'
-  Say '  1) 只检查：本机版本 vs 上游目标版本，看有没有对应的预编译产物'
+  Say '  1) 只检查：本机版本 vs 上游目标版本，看有没有对应的预编译产物（不下载、不落地）'
   Say '  2) 下载并覆盖产物（不跑 hermes update）'
   Say '  3) 下载覆盖 + 运行 hermes update（推荐）'
   Say '  4) 选一个具体 tag/SHA 再执行'
@@ -539,7 +541,7 @@ if ($Diagnose -or (-not $Ref -and -not $Yes)) {
   if ($Diagnose) { return }
   $choice = Read-Host '选择'
   switch ($choice) {
-    '1' { $Ref = $Ref }
+    '1' { $CheckOnly = $true }
     '2' { $SkipUpdate = $true }
     '3' { }
     '4' { $Ref = Read-Host '  输入 tag / 分支 / SHA（如 v0.23.1）' }
@@ -569,6 +571,20 @@ if (-not $art) {
   return
 }
 Ok ("找到产物 {0}（{1:N0} MB，通道={2}）" -f $art.Name, ($art.Size / 1MB), $art.Kind)
+
+if ($CheckOnly) {
+  Say ''
+  $same = ($i.Commit -eq $target.Sha)
+  Say ("  本机 HEAD {0}   目标 {1}   → {2}" -f $i.Commit.Substring(0, 12), $target.Sha.Substring(0, 12),
+       $(if ($same) { '已对齐，直接覆盖产物即可' } else { '落后：脚本会先补源码快照再 checkout' })) 'Cyan'
+  if ($same) { Ok '  结论：可以升级，覆盖 + 重签约 2 分钟，build 段 0 秒' }
+  else       { Ok '  结论：可以升级，多一步源码灌对象（约 3-6 分钟）' }
+  Say ''
+  Say '  真正升级：重跑并选 3（覆盖 + hermes update）' 'Yellow'
+  Say '  只下载并完整校验、不落地：重跑并加 -DryRun' 'Yellow'
+  return
+}
+
 $root = Get-Artifact $art
 if (-not (Verify-Payload $root $target $i)) {
   Say '  产物校验不过 → 不覆盖，保持现状（下次 hermes update 会本地全量编译）' 'Yellow'

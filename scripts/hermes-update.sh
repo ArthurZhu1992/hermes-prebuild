@@ -10,7 +10,8 @@
 #   ./hermes-update.sh                      # 交互菜单
 #   ./hermes-update.sh --diagnose           # 只看状态
 #   ./hermes-update.sh --ref v0.23.1 --yes  # 非交互直接干
-#   ./hermes-update.sh --dry-run            # 全部检查通过但不落地
+#   ./hermes-update.sh --check              # 只报有没有产物/差多少，不下载（菜单里的 1）
+#   ./hermes-update.sh --dry-run            # 下载并全部校验通过但不落地
 #   ./hermes-update.sh --skip-update        # 只覆盖，不跑 hermes update
 #   ./hermes-update.sh --rollback           # 回滚上一次覆盖
 #   ./hermes-update.sh --proxy 127.0.0.1:7890        # 指定代理（ip:port 默认 http）
@@ -24,7 +25,7 @@ set -uo pipefail
 
 BUILDER_REPO="${BUILDER_REPO:-ArthurZhu1992/hermes-prebuild}"
 UPSTREAM="${UPSTREAM:-NousResearch/hermes-agent}"
-REF=""; DIAGNOSE=0; DRY_RUN=0; YES=0; SKIP_UPDATE=0; ROLLBACK=0
+REF=""; DIAGNOSE=0; DRY_RUN=0; CHECK_ONLY=0; YES=0; SKIP_UPDATE=0; ROLLBACK=0
 PROXY_URL="${PROXY_URL:-}"; SKIP_PROXY=0
 SOURCE="${SOURCE:-auto}"   # auto | artifact | release
 STAMP_TS=$(date +%Y%m%d-%H%M%S)
@@ -39,6 +40,7 @@ while [ $# -gt 0 ]; do
     --source) SOURCE="$2"; shift 2;;
     --source=*) SOURCE="${1#*=}"; shift;;
     --diagnose) DIAGNOSE=1; shift;;
+    --check) CHECK_ONLY=1; shift;;
     --dry-run) DRY_RUN=1; shift;;
     -y|--yes) YES=1; shift;;
     --skip-update) SKIP_UPDATE=1; shift;;
@@ -472,7 +474,7 @@ fi
 if [ "$DIAGNOSE" = 1 ] || { [ -z "$REF" ] && [ "$YES" = 0 ]; }; then
   head_ ''; head_ '── 可选操作 ─────────────────────────────────────────────────────'
   cat <<'MENU'
-  1) 只检查：本机版本 vs 目标版本，看有没有对应产物
+  1) 只检查：本机版本 vs 目标版本，看有没有对应产物（不下载、不落地）
   2) 下载并覆盖产物（不跑 hermes update）
   3) 下载覆盖 + 运行 hermes update（推荐）
   4) 选一个具体 tag/SHA 再执行
@@ -484,7 +486,7 @@ MENU
   [ "$DIAGNOSE" = 1 ] && exit 0
   read -r -p '选择: ' choice
   case "$choice" in
-    1) : ;;
+    1) CHECK_ONLY=1 ;;
     2) SKIP_UPDATE=1 ;;
     3) : ;;
     4) read -r -p '  输入 tag/分支/SHA（如 v0.23.1）: ' REF ;;
@@ -513,6 +515,22 @@ if ! locate_payload; then
   exit 1
 fi
 ok "找到产物 $ART_NAME（$((ART_SIZE/1024/1024)) MB，通道=$PAYLOAD_KIND）"
+
+if [ "$CHECK_ONLY" = 1 ]; then
+  local_sha=$(jget commit)
+  head_ ''
+  if [ "$local_sha" = "$T_SHA" ]; then
+    c '0;36' "  本机 HEAD ${local_sha:0:12}   目标 ${T_SHA:0:12}   → 已对齐，覆盖产物即可"
+    ok '  结论：可以升级，覆盖 + 重签约 2 分钟，build 段 0 秒'
+  else
+    c '0;36' "  本机 HEAD ${local_sha:0:12}   目标 ${T_SHA:0:12}   → 落后，需先补源码快照再 checkout"
+    ok '  结论：可以升级，多一步源码灌对象（约 3-6 分钟）'
+  fi
+  head_ ''
+  warn '  真正升级：重跑并选 3（覆盖 + hermes update）；只下载校验不落地：加 --dry-run'
+  exit 0
+fi
+
 download
 verify || { warn '产物校验不过 → 不覆盖，保持现状（下次 hermes update 会本地全量编译）'; exit 1; }
 # 版本号从产物自带的 manifest.json 读：一条 release 一份，不依赖任何滚动覆盖的文件
