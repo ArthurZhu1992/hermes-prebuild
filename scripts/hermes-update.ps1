@@ -17,6 +17,7 @@
   .\hermes-update.ps1 -Diagnose          # 只看状态，不改任何东西
   .\hermes-update.ps1 -Ref v0.23.1 -Yes  # 非交互：直接干到 v0.23.1
   .\hermes-update.ps1 -CheckOnly         # 只报有没有产物/差多少，不下载（菜单里的 1）
+  .\hermes-update.ps1 -Flavor cli        # 强制按纯 CLI 版处理（默认 auto：看有没有 win-unpacked）
   .\hermes-update.ps1 -DryRun            # 下载并走完全部校验，不落地
   .\hermes-update.ps1 -Rollback          # 回到上一次覆盖前的备份
 #>
@@ -31,6 +32,7 @@ param(
   [switch]$Rollback,
   [string]$Proxy,                        # 例：http://127.0.0.1:7890 / socks5://10.0.0.2:1080
   [ValidateSet('auto','artifact','release')][string]$Source = 'auto',   # 产物来源通道
+  [ValidateSet('auto','desktop','cli')][string]$Flavor = 'auto',        # 装的是桌面版还是纯 CLI 版
   [switch]$NoProxy,                      # 忽略系统代理，强制直连
   [string]$BuilderRepo = 'ArthurZhu1992/hermes-prebuild',
   [string]$Upstream    = 'NousResearch/hermes-agent'
@@ -432,7 +434,10 @@ function Ensure-SourceTree($i, $target) {
     $rel = Api-Get "repos/$BuilderRepo/releases/tags/$($target.Ref)"
     $a = @($rel.assets | Where-Object { $_.name -eq $asset })[0]
     if (-not $a) { throw "release $($target.Ref) 里没有 $asset" }
-    Invoke-WebRequest -Uri $a.browser_download_url -OutFile $tar -UseBasicParsing -TimeoutSec 900
+    $curlProxy = @(); if ($script:ProxyUrl) { $curlProxy = @('-x', $script:ProxyUrl) }
+    & curl.exe -fsSL @curlProxy --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 `
+      -o $tar $a.browser_download_url
+    if ($LASTEXITCODE -ne 0) { throw ("curl 退出码 {0}" -f $LASTEXITCODE) }
   } catch {
     Warn ("  取不到源码快照：{0}" -f $_.Exception.Message)
     Warn '  → 需要网络；或者手工把 tar.gz 放到本目录后加 -SourceDir 重跑（本次跳过源码补齐）'
@@ -500,6 +505,14 @@ function Assert-DesktopClosed($i) {
 
 # ─── 主流程 ────────────────────────────────────────────────────────────────
 $i = Get-HermesInstall
+# -Flavor 覆盖自动探测：桌面版取 hermes-<os>-<arch>-<sha>.zip，纯 CLI 版取 hermes-cli-<os>-<arch>-<sha>.zip
+if ($Flavor -ne 'auto') {
+  $wantDesktop = ($Flavor -eq 'desktop')
+  if ($i.Desktop -ne $wantDesktop) {
+    Warn ("按 -Flavor {0} 强制按{1}处理（自动探测结果是{2}）" -f $Flavor, $(if ($wantDesktop) {'桌面版'} else {'纯 CLI 版'}), $(if ($i.Desktop) {'桌面版'} else {'纯 CLI 版'}))
+    $i.Desktop = $wantDesktop
+  }
+}
 Show-Install $i
 if ($i.Payload -eq 'legacy') {
   Warn '这台是老安装（没有 install-stamp.json）：产物可能对不上，建议先正常跑一次 hermes update 再回来用本脚本'
@@ -563,6 +576,9 @@ Say ''
 Say ("目标：{0} @ {1}" -f $target.Ref, $target.Sha.Substring(0, 12)) 'Cyan'
 if ($i.Commit -eq $target.Sha) { Warn '本机已经在这个 commit 上，覆盖没有意义（除非产物丢了）' }
 
+# 先把「桌面还开着」挡在下载之前：否则白下 200 MB 才被断言拦下（实测踩过）
+if (-not $DryRun -and -not $CheckOnly) { Assert-DesktopClosed $i }
+
 $art = Locate-Payload $i $target.Sha.Substring(0, 12)
 if (-not $art) {
   Warn ("找不到产物 {0}（CI 可能还没编这个 SHA，或已过期）" -f $target.Sha.Substring(0, 12))
@@ -598,7 +614,6 @@ try {
 
 if ($DryRun) { Say ''; Say '[DryRun] 检查全部通过，未改动任何文件' 'Cyan'; return }
 
-Assert-DesktopClosed $i
 if (-not $Yes) {
   $go = Read-Host '确认覆盖？(y/N)'
   if ($go -notmatch '^[Yy]') { Say '已取消' 'Yellow'; return }

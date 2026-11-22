@@ -18,6 +18,7 @@
 #   ./hermes-update.sh --proxy socks5://10.0.0.2:1080
 #   ./hermes-update.sh --no-proxy           # 忽略系统代理，强制直连
 #   ./hermes-update.sh --source release     # auto(默认) | artifact | release
+#   ./hermes-update.sh --flavor cli         # auto(默认) | desktop | cli —— 纯 CLI 机器/桌面机显式指定
 #
 #
 # 代理来源优先级：--proxy > 环境变量(HTTPS_PROXY/ALL_PROXY/HTTP_PROXY) > GNOME 系统代理 > 直连
@@ -25,7 +26,7 @@ set -uo pipefail
 
 BUILDER_REPO="${BUILDER_REPO:-ArthurZhu1992/hermes-prebuild}"
 UPSTREAM="${UPSTREAM:-NousResearch/hermes-agent}"
-REF=""; DIAGNOSE=0; DRY_RUN=0; CHECK_ONLY=0; YES=0; SKIP_UPDATE=0; ROLLBACK=0
+REF=""; DIAGNOSE=0; DRY_RUN=0; CHECK_ONLY=0; YES=0; SKIP_UPDATE=0; ROLLBACK=0; FLAVOR=auto
 PROXY_URL="${PROXY_URL:-}"; SKIP_PROXY=0
 SOURCE="${SOURCE:-auto}"   # auto | artifact | release
 STAMP_TS=$(date +%Y%m%d-%H%M%S)
@@ -41,6 +42,7 @@ while [ $# -gt 0 ]; do
     --source=*) SOURCE="${1#*=}"; shift;;
     --diagnose) DIAGNOSE=1; shift;;
     --check) CHECK_ONLY=1; shift;;
+    --flavor) FLAVOR="$2"; shift 2;;
     --dry-run) DRY_RUN=1; shift;;
     -y|--yes) YES=1; shift;;
     --skip-update) SKIP_UPDATE=1; shift;;
@@ -147,6 +149,16 @@ print(json.dumps(out))
 PY
 }
 
+jget() { printf '%s' "$PROBE" | python3 -c "import json,sys;print(json.load(sys.stdin)['$1'])"; }
+# 装的是桌面版还是纯 CLI 版：--flavor auto|desktop|cli（auto = 看本地有没有 linux-unpacked）
+is_desktop() {
+  case "${FLAVOR:-auto}" in
+    desktop) return 0 ;;
+    cli) return 1 ;;
+  esac
+  [ "$(jget desktop)" = "True" ]
+}
+
 show_install() {
   head_ ''
   head_ '── 本机 Hermes 安装 ─────────────────────────────────────────────'
@@ -156,13 +168,13 @@ show_install() {
   printf '  commit      : %s\n' "$(jget commit)"
   printf '  渠道        : %s\n' "$(jget channel)"
   printf '  形态        : payload=%s  updateMechanism=%s\n' "$(jget payload)" "$(jget mech)"
-  if [ "$(jget desktop)" = "True" ]; then printf '  桌面壳      : 有 (apps/desktop/release/linux-unpacked)\n'
+  if is_desktop; then printf '  桌面壳      : 有 (apps/desktop/release/linux-unpacked)\n'
   else printf '  桌面壳      : 无（纯 CLI）\n'; fi
   printf '  Node 版本   : %s\n' "$(jget node)"
   printf '  磁盘余量    : %s GB\n' "$(jget free_gb)"
   head_ '─────────────────────────────────────────────────────────────────'
 }
-jget() { printf '%s' "$PROBE" | python3 -c "import json,sys;print(json.load(sys.stdin)['$1'])"; }
+
 [ -d "$INSTALL_DIR" ] || warn "安装目录不存在：$INSTALL_DIR（下面会照常显示，但覆盖会失败）"
 PROBE=$(probe)
 
@@ -209,7 +221,7 @@ resolve_target() {
 
 find_artifact() {
   short="${T_SHA:0:12}"
-  if [ "$(jget desktop)" = "True" ]; then want="hermes-linux-$ARCH-$short"; else want="hermes-cli-linux-$short"; fi
+  if is_desktop; then want="hermes-linux-$ARCH-$short"; else want="hermes-cli-linux-$short"; fi
   ART=$(api_get "repos/$BUILDER_REPO/actions/artifacts?per_page=100" \
         ".artifacts[] | select(.name==\"$want\" and .expired==false) | \"\(.id) \(.size_in_bytes)\"" \
         | sort -k1 -n | tail -1)
@@ -305,7 +317,7 @@ verify() {
     [ "$3" = "$ARCH" ]  || bad+=("manifest.arch=$3 不是 $ARCH")
     if [ "$(jget node)" != unknown ] && [ "$4" != "$(jget node)" ]; then bad+=("manifest.node=$4 != 本机 $(jget node)"); fi
   fi
-  if [ "$(jget desktop)" = "True" ]; then
+  if is_desktop; then
     st="$ROOT/apps/desktop/release/linux-unpacked/resources/install-stamp.json"
     if [ ! -f "$st" ]; then bad+=('linux-unpacked/resources/install-stamp.json 缺失')
     else
@@ -316,6 +328,9 @@ verify() {
   for r in hermes_cli/web_dist/hermes-build.json ui-tui/dist/hermes-build.json; do
     [ -f "$ROOT/$r" ] || bad+=("$r 缺失")
   done
+  if is_desktop && [ ! -f "$ROOT/apps/desktop/dist/hermes-build.json" ]; then
+    bad+=('apps/desktop/dist/hermes-build.json 缺失（桌面版产物不完整）')
+  fi
   if [ ${#bad[@]} -gt 0 ]; then
     c '0;31' '  校验未通过：'; printf '    - %s\n' "${bad[@]}"
     return 1
@@ -440,7 +455,7 @@ rollback() {
 }
 
 assert_closed() {
-  [ "$(jget desktop)" = "True" ] || return 0
+  is_desktop || return 0
   if pgrep -f 'linux-unpacked/Hermes' >/dev/null 2>&1; then
     die 'Hermes 桌面正在运行，请先退出（它锁着 linux-unpacked）'
   fi
@@ -509,6 +524,9 @@ head_ ''
 c '0;36' "目标：$T_REF @ ${T_SHA:0:12}"
 [ "$(jget commit)" = "$T_SHA" ] && warn '本机已经在这个 commit 上，覆盖没有意义（除非产物丢了）'
 
+# 把「桌面还开着」挡在下载之前，否则白下 200 MB 才被断言拦下
+if [ "$DRY_RUN" = 0 ] && [ "$CHECK_ONLY" = 0 ]; then assert_closed; fi
+
 if ! locate_payload; then
   warn "找不到产物 ${T_SHA:0:12}（CI 还没编这个 SHA，或已过期）"
   say "  处理：gh workflow run prebuild.yml -R $BUILDER_REPO -f ref=$T_REF"
@@ -538,7 +556,6 @@ ver=$(python3 -c "import json;print(json.load(open('$ROOT/manifest.json')).get('
 [ -n "${ver:-}" ] && ok "对应版本：$ver" 
 [ "$DRY_RUN" = 1 ] && { head_ ''; c '0;36' '[DryRun] 检查全部通过，未改动任何文件'; exit 0; }
 
-assert_closed
 if [ "$YES" = 0 ]; then read -r -p '确认覆盖？(y/N) ' go; [[ "$go" =~ ^[Yy] ]] || { warn '已取消'; exit 0; }; fi
 
 ensure_source_tree || warn '  源码树没对齐：产物照常覆盖，但 hermes update 的 git checkout 可能卡住（有网才行）'

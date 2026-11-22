@@ -138,37 +138,45 @@ Node 版本固定 `26.12.1`（取自 `pm/lock.json`），这是 receipt 校验�
 
 两个脚本做同一件事，只在平台实现上不同：
 
-| 平台 | 脚本 |
-|---|---|
-| Windows | `scripts/hermes-update.ps1` |
-| Linux | `scripts/hermes-update.sh` |
+| 平台 | 脚本 | 依赖 |
+|---|---|---|
+| Windows | `scripts/hermes-update.ps1` | `sign-receipts.mjs`（同目录）、`curl.exe`（Win10+ 自带） |
+| Linux | `scripts/hermes-update.sh` | `sign-receipts.mjs`（同目录）、`curl`、`python3`、目标机自带的 node |
 
-下载后：
+**`sign-receipts.mjs` 必须和主脚本放同一个目录**：覆盖产物后要用它按本机源码树重签三份 receipt，
+缺了它脚本会静默跳过重签，结果是"能跑但下次 `hermes update` 又白编一遍"。
 
-```powershell
-# Windows
-powershell -ExecutionPolicy Bypass -File .\hermes-update.ps1
+### 3.1 两种安装形态，脚本都会处理
+
+| 形态 | 怎么认出来 | 用哪个产物包 | 覆盖哪些 | 升级前要关掉什么 |
+|---|---|---|---|---|
+| **桌面版**（Electron 壳 + CLI） | 安装目录里有 `apps/desktop/release/{win,linux}-unpacked/` | `hermes-<os>-<arch>-<sha12>.zip`（~203 MB） | `win-unpacked`/`linux-unpacked`、`apps/desktop/dist`、`build/install-stamp.json`、`build/native-deps*`、`hermes_cli/web_dist`、`ui-tui/dist` | **必须完全退出桌面版**（它锁着 unpacked 里的可执行文件） |
+| **纯 CLI 版**（服务器/无 Electron） | 没有 unpacked 目录 | `hermes-cli-<os>-<arch>-<sha12>.zip`（~2 MB） | 只有 `hermes_cli/web_dist` + `ui-tui/dist` | 不用关任何窗口 |
+
+自动识别靠"有没有 unpacked"，也可以用参数强制：`-Flavor desktop|cli`（Windows）/ `--flavor desktop|cli`（Linux）。
+强制时会打印一行提示，说明自动探测结果与你的选择不一致。
+
+### 3.2 一次升级实际做的事
+
+1. **探测**：`HERMES_HOME`、安装目录、版本、commit、渠道（stable/main）、`payload`/`updateMechanism`、
+   有没有桌面壳、`pm/lock.json` 的 Node pin、磁盘余量
+2. **选目标**：渠道 `stable` → 上游最新正式 tag；`main` → 上游 HEAD；或 `-Ref/--ref` 指定
+3. **找产物**：按 `<形态>-<os>-<arch>-<sha12>` 在 release 里精确匹配（`--check` 到这一步就停，不下载）
+4. **下载 + 五道校验**：`manifest.sha` / `platform` / `arch` / `node`、`win-unpacked|linux-unpacked/resources/install-stamp.json`
+   的 `commit`。任一不过 → **什么都不改**
+5. **（HEAD 落后时）补源码**：从 release 取 `hermes-src-<tag>.tar.gz`，两遍 `git hash-object -w`
+   （带 filter + `--no-filters`）灌进对象库，再 `git checkout -f <sha>` —— 全程不需要 git 网络
+6. **备份 → 覆盖 → 重签 receipt → `hermes update`**
+   - 备份在 `<安装目录>/.hermes-prebuild-backup-<时间戳>/`，覆盖失败自动回滚
+   - 重签：`node sign-receipts.mjs <安装目录>` 让 `productCurrent` 变 true，`hermes update` 的 build 段才会真的跳过
+   - 桌面进程检查在**下载之前**（不然白下 200 MB 才被拦）
+
+### 3.3 交互菜单
+
+不带参数运行 = 先打印安装状态，再给菜单：
+
 ```
-```bash
-# Linux
-chmod +x hermes-update.sh && ./hermes-update.sh
-```
-
-脚本依次做：
-
-1. **探测**：`HERMES_HOME`、安装目录、版本、commit、渠道（main/stable）、
-   `payload`/`updateMechanism`、有没有桌面壳、`pm/lock.json` 的 Node pin、磁盘余量
-2. **选目标**：渠道 `stable` → 最新正式 tag；`main` → 上游 HEAD；或 `--ref` 指定
-3. **找产物**：按 `hermes-<os>-<arch>-<sha12>` 匹配，没有桌面壳就用 `hermes-cli-*` 轻包
-4. **校验**：`manifest.sha` / `platform` / `arch` / `node`、烘焙 stamp 的 `commit`、三个 receipt 是否存在
-5. **备份 → 覆盖 → 可选跑 `hermes update`**：备份在 `<安装目录>/.hermes-prebuild-backup-<时间戳>/`
-
-### 交互菜单
-
-不带参数运行会先打印安装状态，然后给菜单：
-
-```
-  1) 只检查：本机版本 vs 目标版本，看有没有对应产物
+  1) 只检查：本机版本 vs 目标版本，看有没有对应产物（不下载、不落地）
   2) 下载并覆盖产物（不跑 hermes update）
   3) 下载覆盖 + 运行 hermes update（推荐）
   4) 选一个具体 tag/SHA 再执行
@@ -177,57 +185,47 @@ chmod +x hermes-update.sh && ./hermes-update.sh
   0) 退出
 ```
 
-### 非交互 / 自动化
+### 3.4 非交互 / 自动化
 
-```bash
-./hermes-update.sh --diagnose            # 只打印状态
-./hermes-update.sh --dry-run             # 走完所有检查，不落地
-./hermes-update.sh --ref v0.23.1 --yes   # 直接干到 v0.23.1
-./hermes-update.sh --skip-update --yes   # 只覆盖，不更新
-./hermes-update.sh --rollback            # 回滚上一次覆盖
-```
+| 用途 | Windows | Linux |
+|---|---|---|
+| 只打印安装状态 | `-Diagnose` | `--diagnose` |
+| 只查产物与版本差异（零下载） | `-CheckOnly` | `--check` |
+| 下载并全部校验、不落地 | `-DryRun` | `--dry-run` |
+| 直接升到某版本 | `-Ref v0.23.3 -Yes` | `--ref v0.23.3 --yes` |
+| 只覆盖不更新 | `-SkipUpdate` | `--skip-update` |
+| 回滚 | `-Rollback` | `--rollback` |
+| 指定代理 | `-Proxy http://127.0.0.1:7890` | `--proxy http://127.0.0.1:7890` |
+| 强制直连 | `-NoProxy` | `--no-proxy` |
+| 产物通道 | `-Source auto\|release\|artifact` | `--source …` |
+| 安装形态 | `-Flavor auto\|desktop\|cli` | `--flavor …` |
 
 ```powershell
-.\hermes-update.ps1 -Diagnose
-.\hermes-update.ps1 -DryRun
-.\hermes-update.ps1 -Ref v0.23.1 -Yes
+# Windows
+.\hermes-update.ps1 -CheckOnly                 # 零下载，先看有没有得升
+.\hermes-update.ps1 -Ref v0.23.3 -Yes          # 升级（必须先退出桌面版）
+.\hermes-update.ps1 -Flavor cli -Ref v0.23.3 -Yes   # 纯 CLI 服务器
 .\hermes-update.ps1 -Rollback
 ```
 
-### 要 token 吗
+```bash
+# Linux
+./hermes-update.sh --check
+./hermes-update.sh --ref v0.23.3 --yes
+./hermes-update.sh --flavor cli --ref v0.23.3 --yes
+./hermes-update.sh --rollback
+```
+
+### 3.5 失败与回滚
+
+- 五道校验任一不过：直接退出，**不改任何文件**。
+- 覆盖中途失败：脚本自动执行回滚（把备份移回来）。
+- 回滚后仍是升级前的版本，可以照常启动。
+
+### 3.6 要 token 吗
 
 **不需要。** release 通道匿名可下，公开 API 匿名 60 次/小时够这个脚本用。
-只有强制 `--source artifact` 才需要 token（`gh auth login` 或 `export GITHUB_TOKEN=…`）。
-
-没有 `gh` 也行：脚本自动退化到 `curl` + `jq`；两者都没有时会提示你装哪个。
-
-环境变量可覆盖仓库名：`BUILDER_REPO`（bash）/ 参数 `-BuilderRepo`（PS）。
-
-### 代理（下载 artifact 与 `gh api` 都要用）
-
-优先级：**命令行 `--proxy` > 环境变量 > 系统代理 > 直连**。
-
-| 平台 | 自动读取的系统代理 |
-|---|---|
-| Windows | 注册表 `HKCU\...\Internet Settings` 的 `ProxyEnable`/`ProxyServer`（支持 `http=host:port;https=host:port` 写法），以及 `HTTPS_PROXY`/`ALL_PROXY`/`HTTP_PROXY` |
-| Linux | `HTTPS_PROXY`/`ALL_PROXY`/`HTTP_PROXY`；GNOME 桌面读 `gsettings get org.gnome.system.proxy mode` == `manual` 时的 host/port（含 socks） |
-
-```bash
-./hermes-update.sh --proxy 127.0.0.1:7890         # 只写 ip:端口时默认按 http://
-./hermes-update.sh --proxy socks5://10.0.0.2:1080
-./hermes-update.sh --no-proxy                     # 无视系统代理，强制直连
-```
-```powershell
-.\hermes-update.ps1 -Proxy 127.0.0.1:7890
-.\hermes-update.ps1 -NoProxy
-```
-
-行为细节：
-
-- 解析到代理后**先实测**（`curl -x <proxy> https://api.github.com/` 必须 200 才算通）
-- 不通时：交互模式问你要不要改直连；`--yes` 直接报错退出；`--diagnose` 只警告并按直连继续
-- 交互菜单里有 `6) 手动指定代理`，可现场输入 `ip:端口`
-- 代理只作用于**本脚本的下载与 API 调用**（`curl` + `gh`）；`hermes update` 自己的 git/uv/pnpm 走它自己的镜像与 git 配置，不受影响
+只有强制 `--source artifact` 才需要 token（Actions artifact 下载必须认证）。
 
 ## 4. 覆盖之后会发生什么
 
