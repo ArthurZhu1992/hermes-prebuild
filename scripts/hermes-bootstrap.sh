@@ -53,7 +53,18 @@ if [ -z "$hit" ]; then
 fi
 
 printf '\033[0;32m  脚本就位：%s\033[0m\n\n' "$DIR"
-if [ -r /dev/tty ]; then
+
+# 没有参数 + 没有终端 = 菜单会立刻 EOF（CI/管道场景）。直接给出提示，别让人对着空屏猜。
+if [ $# -eq 0 ] && ! ( exec </dev/tty ) 2>/dev/null; then
+  printf '\033[0;33m!! 当前不是交互终端，菜单无法使用。请带参数重跑，例如：\033[0m\n' >&2
+  printf '   curl -fsSL <本脚本> | bash -s -- --check\n' >&2
+  printf '   curl -fsSL <本脚本> | bash -s -- --ref v0.23.3 --yes\n' >&2
+  exit 2
+fi
+
+# `curl | bash` 把管道接到了 bash 的 stdin，菜单的 read 读不到键盘 ——
+# 有可用终端就把 /dev/tty 还给它；`[ -r /dev/tty ]` 不够（文件在但可能打不开），要真试一次 exec。
+if ( exec </dev/tty ) 2>/dev/null; then
   exec bash "$DIR/hermes-update.sh" "$@" </dev/tty
 else
   exec bash "$DIR/hermes-update.sh" "$@"
