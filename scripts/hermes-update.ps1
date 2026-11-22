@@ -179,7 +179,7 @@ function Show-Install($i) {
   $rootDrive = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($i.Home))
   $free = ([IO.DriveInfo]::new($rootDrive)).AvailableFreeSpace / 1GB
   Say ("  磁盘余量    : {0:N1} GB" -f $free)
-  Say '─────────────────────────────────────────────────────────────────' 'Cyan'
+  Say '-----------------------------------------------------------------' 'Cyan'
 }
 
 # ─── 2. 目标版本 ────────────────────────────────────────────────────────────
@@ -421,7 +421,7 @@ function Show-Plan($i) {
 
 function Show-Menu {
   Say ''
-  Say '── 可选操作 ─────────────────────────────────────────────────────' 'Cyan'
+  Say '--- actions -----------------------------------------------------' 'Cyan'
   Say '  1) 只检查：当前版本 vs 目标版本，看有没有对应产物（不下载、不落地）'
   Say '  2) 下载并覆盖产物（不跑 hermes update）'
   Say '  3) 下载覆盖 + 运行 hermes update（推荐）'
@@ -429,7 +429,7 @@ function Show-Menu {
   Say '  5) 回滚到上一次备份'
   Say ("  6) 手动指定代理（当前：{0}）" -f $(if ($script:ProxyUrl) { $script:ProxyUrl } else { '直连' }))
   Say '  0) 退出'
-  Say '─────────────────────────────────────────────────────────────────' 'Cyan'
+  Say '-----------------------------------------------------------------' 'Cyan'
 }
 
 function Get-NodeExe($i) {
@@ -484,18 +484,29 @@ function Ensure-SourceTree($i, $target) {
   New-Item -ItemType Directory -Force -Path $tmp | Out-Null
   $tar = Join-Path $tmp 'src.tar.gz'
 
-  Say ("  取源码快照 {0} ..." -f $asset) 'Cyan'
+  $urls = @()
   try {
     $rel = Api-Get "repos/$BuilderRepo/releases/tags/$($target.Ref)"
     $a = @($rel.assets | Where-Object { $_.name -eq $asset })[0]
-    if (-not $a) { throw "release $($target.Ref) 里没有 $asset" }
-    $curlProxy = @(); if ($script:ProxyUrl) { $curlProxy = @('-x', $script:ProxyUrl) }
-    & curl.exe -fsSL @curlProxy --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 `
-      -o $tar $a.browser_download_url
-    if ($LASTEXITCODE -ne 0) { throw ("curl 退出码 {0}" -f $LASTEXITCODE) }
-  } catch {
-    Warn ("  取不到源码快照：{0}" -f $_.Exception.Message)
-    Warn '  → 需要网络；或者手工把 tar.gz 放到本目录后加 -SourceDir 重跑（本次跳过源码补齐）'
+    if ($a) { $urls += $a.browser_download_url }
+  } catch { }
+  if ($urls.Count -eq 0) {
+    # release 里没有（老版本构建时还没有 build-src job）→ 回退上游官方 archive，同 tag 同内容、前缀一致
+    Say ("  release 里没有 {0}，回退上游官方 archive" -f $asset) 'DarkGray'
+  }
+  $urls += "https://github.com/$Upstream/archive/refs/tags/$($target.Ref).tar.gz"
+
+  $curlProxy = @(); if ($script:ProxyUrl) { $curlProxy = @('-x', $script:ProxyUrl) }
+  $got = $false
+  foreach ($u in $urls) {
+    Say ("  取源码：{0}" -f $u) 'DarkGray'
+    & curl.exe -fsSL @curlProxy --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 -o $tar $u
+    if ($LASTEXITCODE -eq 0 -and (Test-Path $tar) -and (Get-Item $tar).Length -gt 1MB) { $got = $true; break }
+    Remove-Item $tar -Force -ErrorAction SilentlyContinue
+  }
+  if (-not $got) {
+    Warn '  取不到源码快照（release 与上游 archive 都失败）'
+    Warn '  → 需要网络；或手工把 tar.gz 放到本目录后重跑'
     return $false
   }
   Ok ("  已下载 {0:N0} MB" -f ((Get-Item $tar).Length / 1MB))
@@ -730,9 +741,21 @@ if (-not $SkipUpdate) {
   # 会丢掉全局配置里的 -i <key>，origin 是 SSH 时必然 exit 128。GIT_SSH_COMMAND 优先级更高。
   if (-not $env:GIT_SSH_COMMAND) {
     $sc = (& git config --get core.sshCommand 2>$null)
+    if (-not $sc) {
+      # 很多人只在 ~/.ssh 放了专用私钥、没写 core.sshCommand（实测本机就是这种）
+      $key = Join-Path $env:USERPROFILE '.ssh\hermes-updater'
+      if (Test-Path $key) {
+        $sc = 'ssh -i "' + ($key -replace '\\', '/') + '"'
+        Say ("  没配 core.sshCommand，改用专用密钥 {0}" -f $key) 'DarkGray'
+      }
+    }
     if ($sc) {
-      $env:GIT_SSH_COMMAND = "$sc -o BatchMode=yes"
-      Say ("  已把 core.sshCommand 传给 hermes update：{0}" -f $env:GIT_SSH_COMMAND) 'DarkGray'
+      if ($sc -notmatch 'BatchMode') { $sc = "$sc -o BatchMode=yes" }
+      $env:GIT_SSH_COMMAND = $sc
+      Say ("  已把 SSH 身份传给 hermes update：{0}" -f $env:GIT_SSH_COMMAND) 'DarkGray'
+    } else {
+      Warn '  没找到 core.sshCommand，也没找到 ~/.ssh/hermes-updater'
+      Warn '  → hermes update 若报 ls-remote exit 128 就是这里；先 git config --global core.sshCommand "ssh -i <key>"'
     }
   }
   Say '── 运行 hermes update（build 段应命中 receipt 直接跳过）────────────' 'Cyan'

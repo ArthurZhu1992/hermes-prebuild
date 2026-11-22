@@ -173,7 +173,7 @@ show_install() {
   else printf '  桌面壳      : 无（纯 CLI）\n'; fi
   printf '  Node 版本   : %s\n' "$(jget node)"
   printf '  磁盘余量    : %s GB\n' "$(jget free_gb)"
-  head_ '─────────────────────────────────────────────────────────────────'
+  head_ '-----------------------------------------------------------------'
 }
 
 [ -d "$INSTALL_DIR" ] || warn "安装目录不存在：$INSTALL_DIR（下面会照常显示，但覆盖会失败）"
@@ -435,8 +435,12 @@ ensure_source_tree() {
   tmp=$(mktemp -d)
   head_ '  取源码快照 '"$asset"' ...'
   if ! download_asset "$tag" "$asset" "$tmp/$asset"; then
-    warn "  取不到 $asset（需要网络）；本次跳过源码补齐"
-    rm -rf "$tmp"; return 1
+    say "  release 里没有 $asset，回退上游官方 archive"
+    if ! curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 20 \
+         -o "$tmp/$asset" "https://github.com/$UPSTREAM/archive/refs/tags/$tag.tar.gz"; then
+      warn '  取不到源码快照（release 与上游 archive 都失败）；本次跳过源码补齐'
+      rm -rf "$tmp"; return 1
+    fi
   fi
   ok "  已下载 $(( $(stat -c%s "$tmp/$asset") / 1048576 )) MB"
   tar -xzf "$tmp/$asset" -C "$tmp" || { warn '  tar 解包失败'; rm -rf "$tmp"; return 1; }
@@ -532,7 +536,7 @@ fi
 if [ "$DIAGNOSE" = 1 ] || { [ -z "$REF" ] && [ "$YES" = 0 ]; }; then
   # 菜单循环：1（只检查）/ 6（代理）执行完回到菜单，2/3/4 才进主流程
   while :; do
-    head_ ''; head_ '── 可选操作 ─────────────────────────────────────────────────────'
+    head_ ''; head_ '--- actions -----------------------------------------------------'
     cat <<'MENU'
   1) 只检查：当前版本 vs 目标版本，看有没有对应产物（不下载、不落地）
   2) 下载并覆盖产物（不跑 hermes update）
@@ -542,7 +546,7 @@ if [ "$DIAGNOSE" = 1 ] || { [ -z "$REF" ] && [ "$YES" = 0 ]; }; then
   6) 手动指定代理（ip:端口 / http://… / socks5://…，留空=直连）
   0) 退出
 MENU
-    head_ '─────────────────────────────────────────────────────────────────'
+    head_ '-----------------------------------------------------------------'
     [ "$DIAGNOSE" = 1 ] && exit 0
     read -r -p '选择: ' choice || exit 0
     case "$choice" in
@@ -621,9 +625,18 @@ if [ "$SKIP_UPDATE" = 0 ]; then
   # 会丢掉全局配置里的 -i <key>，origin 是 SSH 时必然 exit 128。GIT_SSH_COMMAND 优先级更高。
   if [ -z "${GIT_SSH_COMMAND:-}" ] && command -v git >/dev/null 2>&1; then
     sc=$(git config --get core.sshCommand 2>/dev/null || true)
+    if [ -z "${sc:-}" ] && [ -f "$HOME/.ssh/hermes-updater" ]; then
+      # 只放了专用私钥、没写 core.sshCommand 的机器（实测很常见）
+      sc="ssh -i $HOME/.ssh/hermes-updater"
+      c '0;90' "  没配 core.sshCommand，改用专用密钥 $HOME/.ssh/hermes-updater"
+    fi
     if [ -n "${sc:-}" ]; then
-      export GIT_SSH_COMMAND="$sc -o BatchMode=yes"
-      c '0;90' "  已把 core.sshCommand 传给 hermes update：$GIT_SSH_COMMAND"
+      case "$sc" in *BatchMode*) ;; *) sc="$sc -o BatchMode=yes";; esac
+      export GIT_SSH_COMMAND="$sc"
+      c '0;90' "  已把 SSH 身份传给 hermes update：$GIT_SSH_COMMAND"
+    else
+      warn '  没找到 core.sshCommand，也没找到 ~/.ssh/hermes-updater'
+      warn '  → hermes update 报 ls-remote 128 就是这里；先 git config --global core.sshCommand "ssh -i <key>"'
     fi
   fi
   head_ '── 运行 hermes update（build 段应命中 receipt 直接跳过）────────────'
