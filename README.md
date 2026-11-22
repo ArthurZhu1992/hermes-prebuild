@@ -50,7 +50,7 @@ powershell -ExecutionPolicy Bypass -File "$env:TEMP\hermes-prebuild\hermes-updat
 bash "${TMPDIR:-/tmp}/hermes-prebuild/hermes-update.sh" --check
 ```
 
-## 0.1 手动快速上手（30 秒）## 0.1 手动快速上手（30 秒）
+## 0.1 手动快速上手（30 秒）
 
 脚本**随每个正式版一起发在 release 里**，不用碰 `raw.githubusercontent.com`（国内常年不通）：
 
