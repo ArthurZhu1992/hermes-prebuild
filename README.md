@@ -99,8 +99,19 @@ https://raw.githubusercontent.com/ArthurZhu1992/hermes-prebuild/main/scripts/sig
 
 | 来源 | release tag | 标题 | 保留策略 |
 |---|---|---|---|
-| 上游最新 release tag（自动） | `v0.23.1` | `v0.23.1` | **永久**，回退锚点 |
+| 上游最新 release tag（自动） | `v0.23.3` | `v0.23.3` | **永久**，回退锚点 |
 | 手动指定历史 tag（`--ref v0.22.7`） | `v0.22.7` | `v0.22.7` | **永久**，每个正式版都能回退 |
+
+每条 release 的资产构成（`build-src` job 与产物并行跑）：
+
+| 资产 | 大小 | 用途 |
+|---|---|---|
+| `hermes-win-x64-<sha12>.zip` / `hermes-linux-x64-<sha12>.zip` | 203 / 164 MB | 桌面版编译产物 |
+| `hermes-cli-linux-<sha12>.zip` / `hermes-cli-win-x64-<sha12>.zip` | 2.4 MB ×2 | 纯 CLI 版产物 |
+| `manifest.json` | 0.5 KB | `{version, ref, sha, node, assets[]}`，脚本据此校验 |
+| **`hermes-src-<version>.tar.gz`** | **90 MB** | 上游源码快照：partial clone 换版本时离线补 git 对象（脚本没有它也能回退上游 archive） |
+| `hermes-bootstrap.ps1` / `.sh` | 3 KB ×2 | 一行命令入口 |
+| `hermes-update.ps1` / `.sh` / `sign-receipts.mjs` | 27/24/4 KB | 同步脚本（后者是重签 receipt 的依赖） |
 
 **只构建上游正式版（release tag）。** `main` 与任意分支/裸 sha 不再出产物：
 dispatch 给了非 tag ref，resolve 会直接跳过、什么都不编；`hermes-update.sh -Ref main` 也找不到东西，
