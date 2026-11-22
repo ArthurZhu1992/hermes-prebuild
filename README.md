@@ -16,12 +16,13 @@
 **Windows（PowerShell）** —— 粘贴即用，脚本自检本机安装再给交互菜单：
 
 ```powershell
-$r=iwr 'https://github.com/ArthurZhu1992/hermes-prebuild/releases/latest/download/hermes-bootstrap.ps1';iex $(if($r.Content-is[byte[]]){[Text.Encoding]::UTF8.GetString($r.Content)}else{$r.Content})
+$r=iwr 'https://github.com/ArthurZhu1992/hermes-prebuild/releases/latest/download/hermes-bootstrap.ps1' -UseBasicParsing;iex $(if($r.Content-is[byte[]]){[Text.Encoding]::UTF8.GetString($r.Content)}else{$r.Content})
 ```
 
 > 为什么不是简单 `irm ... | iex`：release 资产的 `Content-Type` 是 `application/octet-stream`，
 > PowerShell 5.1 的 `irm` 会把它当 `Byte[]`，直接 `| iex` 拿到的是字节数组而不是文本。
-> 上面这行先判类型再解码。引导脚本本身是纯 ASCII —— `irm|iex` 按系统 ANSI 码页解码，中文会被打散成解析错误。
+> 上面这行先判类型再解码。`-UseBasicParsing` 是必须的：不带它时 PS 5.1 会弹出
+> 「Invoke-WebRequest 可解析网页内容…是否继续?」的交互提示，自动化场景会卡在那里。引导脚本本身是纯 ASCII —— `irm|iex` 按系统 ANSI 码页解码，中文会被打散成解析错误。
 
 **Linux（bash）** —— 粘贴即用：
 
