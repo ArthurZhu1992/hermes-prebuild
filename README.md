@@ -11,7 +11,26 @@
 
 ---
 
-## 0. 快速上手（30 秒）
+## 0. 一行命令（推荐）
+
+PowerShell 里粘这一行，脚本自检本机安装，再给交互菜单（1 只检查 / 2 覆盖 / 3 覆盖+update / 4 指定版本 / 5 回滚 / 6 代理 / 0 退出）：
+
+```powershell
+$r=iwr 'https://github.com/ArthurZhu1992/hermes-prebuild/releases/latest/download/hermes-bootstrap.ps1';iex $(if($r.Content-is[byte[]]){[Text.Encoding]::UTF8.GetString($r.Content)}else{$r.Content})
+```
+
+> 为什么不是简单 `irm ... | iex`：release 资产的 `Content-Type` 是 `application/octet-stream`，
+> PowerShell 5.1 的 `irm` 会把它当 `Byte[]`，直接 `| iex` 拿到的是字节数组而不是文本。
+> 上面这行做了类型判断再解码。另外引导脚本本身是纯 ASCII —— `irm|iex` 按系统 ANSI 码页解码，
+> 中文会被打散成解析错误。
+
+如果 `raw.githubusercontent.com` 在你那边能直连（它返回 `text/plain; charset=utf-8`），一行更短：
+
+```powershell
+irm https://raw.githubusercontent.com/ArthurZhu1992/hermes-prebuild/main/scripts/hermes-bootstrap.ps1 | iex
+```
+
+## 0.1 手动快速上手（30 秒）
 
 脚本**随每个正式版一起发在 release 里**，不用碰 `raw.githubusercontent.com`（国内常年不通）：
 
