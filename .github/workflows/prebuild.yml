@@ -563,7 +563,8 @@ jobs:
           # 同步脚本随每个正式版一起发：国内 raw.githubusercontent 常年不通，release 直链快且匿名可下。
           # sign-receipts.mjs 是 hermes-update.* 的依赖（覆盖后重签 receipt），必须同目录同批上传。
           gh release upload "$REL_TAG" dist/*.zip manifest.json \
-            scripts/hermes-bootstrap.ps1 scripts/hermes-update.ps1 scripts/hermes-update.sh scripts/sign-receipts.mjs \
+            scripts/hermes-bootstrap.ps1 scripts/hermes-bootstrap.sh \
+            scripts/hermes-update.ps1 scripts/hermes-update.sh scripts/sign-receipts.mjs \
             -R "$R" --clobber
           # 源码快照：目标机是 partial clone 时靠它离线补 git 对象（详见 build-src job 注释）
           if ls srcpkg/*.tar.gz >/dev/null 2>&1; then

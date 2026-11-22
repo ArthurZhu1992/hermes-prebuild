@@ -13,7 +13,7 @@
 
 ## 0. 一行命令（推荐）
 
-PowerShell 里粘这一行，脚本自检本机安装，再给交互菜单（1 只检查 / 2 覆盖 / 3 覆盖+update / 4 指定版本 / 5 回滚 / 6 代理 / 0 退出）：
+**Windows（PowerShell）** —— 粘贴即用，脚本自检本机安装再给交互菜单：
 
 ```powershell
 $r=iwr 'https://github.com/ArthurZhu1992/hermes-prebuild/releases/latest/download/hermes-bootstrap.ps1';iex $(if($r.Content-is[byte[]]){[Text.Encoding]::UTF8.GetString($r.Content)}else{$r.Content})
@@ -21,16 +21,32 @@ $r=iwr 'https://github.com/ArthurZhu1992/hermes-prebuild/releases/latest/downloa
 
 > 为什么不是简单 `irm ... | iex`：release 资产的 `Content-Type` 是 `application/octet-stream`，
 > PowerShell 5.1 的 `irm` 会把它当 `Byte[]`，直接 `| iex` 拿到的是字节数组而不是文本。
-> 上面这行做了类型判断再解码。另外引导脚本本身是纯 ASCII —— `irm|iex` 按系统 ANSI 码页解码，
-> 中文会被打散成解析错误。
+> 上面这行先判类型再解码。引导脚本本身是纯 ASCII —— `irm|iex` 按系统 ANSI 码页解码，中文会被打散成解析错误。
 
-如果 `raw.githubusercontent.com` 在你那边能直连（它返回 `text/plain; charset=utf-8`），一行更短：
+**Linux（bash）** —— 粘贴即用：
 
-```powershell
-irm https://raw.githubusercontent.com/ArthurZhu1992/hermes-prebuild/main/scripts/hermes-bootstrap.ps1 | iex
+```bash
+curl -fsSL https://raw.githubusercontent.com/ArthurZhu1992/hermes-prebuild/main/scripts/hermes-bootstrap.sh | bash
 ```
 
-## 0.1 手动快速上手（30 秒）
+> `curl | bash` 会把管道接到 bash 的 stdin，菜单里的 `read` 就读不到键盘了 —— 引导脚本最后用
+> `</dev/tty` 把终端还回来，所以菜单照常可用。非交互用法把参数透传进去：
+>
+> ```bash
+> curl -fsSL .../hermes-bootstrap.sh | bash -s -- --check            # 零下载，只看有没有得升
+> curl -fsSL .../hermes-bootstrap.sh | bash -s -- --ref v0.23.3 --yes
+> ```
+
+两边都能**手动**跑等价命令（已经下过脚本时）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "$env:TEMP\hermes-prebuild\hermes-update.ps1" -CheckOnly
+```
+```bash
+bash "${TMPDIR:-/tmp}/hermes-prebuild/hermes-update.sh" --check
+```
+
+## 0.1 手动快速上手（30 秒）## 0.1 手动快速上手（30 秒）
 
 脚本**随每个正式版一起发在 release 里**，不用碰 `raw.githubusercontent.com`（国内常年不通）：
 
