@@ -30,6 +30,7 @@ param(
   [switch]$Yes,
   [switch]$SkipUpdate,
   [switch]$Rollback,
+  [switch]$KillDesktop,                  # 桌面在跑时直接结束它（非交互/自动化用）
   [string]$Proxy,                        # 例：http://127.0.0.1:7890 / socks5://10.0.0.2:1080
   [ValidateSet('auto','artifact','release')][string]$Source = 'auto',   # 产物来源通道
   [ValidateSet('auto','desktop','cli')][string]$Flavor = 'auto',        # 装的是桌面版还是纯 CLI 版
@@ -49,7 +50,7 @@ $Arch = if ([Environment]::Is64BitOperatingSystem) {
 function Say($m, $c = 'Gray') { Write-Host $m -ForegroundColor $c }
 function Ok($m)  { Write-Host "  OK   $m" -ForegroundColor Green }
 function Warn($m){ Write-Host "  !!   $m" -ForegroundColor Yellow }
-function Fail($m){ Write-Host "  XX   $m" -ForegroundColor Red; throw $m }
+function Fail($m){ Write-Host "  XX   $m" -ForegroundColor Red; exit 1 }
 
 # ─── 0. 代理 ────────────────────────────────────────────────────────────────
 function Get-SystemProxy {
@@ -227,13 +228,13 @@ function Find-Artifact($i, $short) {
 # release 通道：资产名 = <artifact 名>.zip
 # 发布结构：只有稳定版一条线 —— tag = 版本号本身（v0.23.1），永久保留，回退锚点。
 #           main / 分支的滚动产物已停出，main 渠道没有预编译可命中。
-function Find-ReleaseAsset($i, $short) {
+function Find-ReleaseAsset($i, $short, $ref) {
   $kind = if ($i.Desktop) { "hermes-win-$Arch-$short" } else { "hermes-cli-win-$Arch-$short" }
   $zipName = "$kind.zip"
   $slugs = @()
-  if ($target.Ref -match '^v') { $slugs += $target.Ref }
+  if ($ref -match '^v') { $slugs += $ref }
   if ($slugs.Count -eq 0) {
-    Say ("  目标 ref「{0}」不是正式版 tag —— 预编译只出稳定版，这条渠道没有产物（用 --set-channel stable 或让 update 本地编译）" -f $target.Ref)
+    Say ("  目标 ref「{0}」不是正式版 tag —— 预编译只出稳定版，这条渠道没有产物（用 --set-channel stable 或让 update 本地编译）" -f $ref)
     return $null
   }
   foreach ($slug in $slugs) {
@@ -250,12 +251,12 @@ function Find-ReleaseAsset($i, $short) {
   return $null
 }
 
-function Locate-Payload($i, $short) {
+function Locate-Payload($i, $short, $ref) {
   switch ($Source.ToLower()) {
     'artifact' { Find-Artifact $i $short }
-    'release'  { Find-ReleaseAsset $i $short }
+    'release'  { Find-ReleaseAsset $i $short $ref }
     default {
-      $a = Find-ReleaseAsset $i $short
+      $a = Find-ReleaseAsset $i $short $ref
       if (-not $a) { $a = Find-Artifact $i $short }
       $a
     }
@@ -377,6 +378,60 @@ function Apply-Payload($root, $i) {
 # prepared.nativeDeps 甚至与 CI 自己上传的目录都对不上 —— 跨机器永远为 false，桌面壳会白编一遍（实测 237 s）。
 # 所以覆盖后按本机源码树重签三份 receipt（hash 全部本地实算）。安全性由前面的校验兜着：
 # manifest.sha == 目标 SHA、win-unpacked 烘焙 stamp.commit == 目标 SHA、且 HEAD == 目标 SHA。
+function SafeShort([string]$s, [int]$n = 12) {
+  if (-not $s) { return 'unknown' }
+  if ($s.Length -le $n) { return $s }
+  return $s.Substring(0, $n)
+}
+
+# 只认 win-unpacked 目录下的 Hermes.exe —— 用进程名匹配会把同为 hermes.exe 的 gateway 也算进去
+function Get-DesktopProcesses($i) {
+  if (-not $i.DesktopExe) { return @() }
+  $dir = Split-Path $i.DesktopExe -Parent
+  @(Get-CimInstance Win32_Process -Filter "Name='Hermes.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($dir, [StringComparison]::OrdinalIgnoreCase) } |
+    ForEach-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue })
+}
+
+# 菜单里的「只检查」：显示 当前版本 → 目标版本，不下载
+function Show-Plan($i) {
+  $cur = if ($i.Version -and $i.Version -ne 'unknown') { "v$($i.Version)" } else { 'unknown' }
+  if (-not $script:PlanTarget) {
+    try { $script:PlanTarget = Resolve-TargetSha $i $null }
+    catch { Warn ("  解析目标版本失败：{0}" -f $_.Exception.Message); return }
+  }
+  $t = $script:PlanTarget
+  Say ''
+  Say ("  当前版本：{0}    HEAD {1}" -f $cur, (SafeShort $i.Commit)) 'Cyan'
+  Say ("  目标版本：{0}    SHA  {1}" -f $t.Ref, (SafeShort $t.Sha)) 'Cyan'
+  $art = Locate-Payload $i $t.Sha.Substring(0, 12) $t.Ref
+  if (-not $art) {
+    Warn '  没有可用产物（CI 还没编这个版本，或资产已过期）'
+    Say ("  可手动触发：gh workflow run prebuild.yml -R {0} -f ref={1}" -f $BuilderRepo, $t.Ref) 'Yellow'
+    return
+  }
+  Ok ("  产物：{0}（{1:N0} MB，{2} 通道）" -f $art.Name, ($art.Size / 1MB), $art.Kind)
+  if ($i.Commit -eq $t.Sha) {
+    Ok '  已是目标版本：覆盖产物 + 重签约 2 分钟，build 段 0 秒'
+  } else {
+    Warn '  落后于目标：脚本会先取源码快照灌 git 对象再 checkout（多 3–6 分钟）'
+  }
+  Say ''
+}
+
+function Show-Menu {
+  Say ''
+  Say '── 可选操作 ─────────────────────────────────────────────────────' 'Cyan'
+  Say '  1) 只检查：当前版本 vs 目标版本，看有没有对应产物（不下载、不落地）'
+  Say '  2) 下载并覆盖产物（不跑 hermes update）'
+  Say '  3) 下载覆盖 + 运行 hermes update（推荐）'
+  Say '  4) 选一个具体 tag/SHA 再执行'
+  Say '  5) 回滚到上一次备份'
+  Say ("  6) 手动指定代理（当前：{0}）" -f $(if ($script:ProxyUrl) { $script:ProxyUrl } else { '直连' }))
+  Say '  0) 退出'
+  Say '─────────────────────────────────────────────────────────────────' 'Cyan'
+}
+
 function Get-NodeExe($i) {
   $tools = Join-Path $env:HERMES_HOME 'tools'
   $cands = @()
@@ -499,8 +554,36 @@ function Invoke-Rollback($i) {
 
 function Assert-DesktopClosed($i) {
   if (-not $i.Desktop) { return }
-  $p = Get-Process -Name 'Hermes' -ErrorAction SilentlyContinue
-  if ($p) { Fail ('Hermes 桌面正在运行（pid {0}）。Windows 会锁住 win-unpacked 里的 exe，先退出桌面再跑。' -f ($p.Id -join ',')) }
+  $procs = @(Get-DesktopProcesses $i)
+  if ($procs.Count -eq 0) { return }
+
+  Warn ("Hermes 桌面正在运行（pid {0}）" -f ($procs.Id -join ','))
+  Say '  Windows 会锁住 win-unpacked 里的 exe，必须先退出。' 'Yellow'
+
+  if ($KillDesktop) {
+    Say '  按 -KillDesktop 结束这些进程...' 'Yellow'
+    $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+    $left = @(Get-DesktopProcesses $i)
+    if ($left.Count) { Fail ("仍有 {0} 个桌面进程没退出，请手动结束" -f $left.Count) }
+    Ok '已结束桌面进程'
+    return
+  }
+  if ($Yes) { Fail '请先退出桌面版（或加 -KillDesktop 让脚本代劳）' }
+
+  Say '    1) 我自己去关（脚本退出，关好再重跑）'
+  Say '    2) 现在结束这些进程（未保存的内容会丢）'
+  Say '    0) 取消'
+  switch (Read-Host '选择') {
+    '2' {
+      $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+      Start-Sleep -Seconds 3
+      $left = @(Get-DesktopProcesses $i)
+      if ($left.Count) { Fail ("仍有 {0} 个桌面进程没退出，请手动结束" -f $left.Count) }
+      Ok '已结束桌面进程，继续'
+    }
+    default { Fail '已取消（退出桌面后重跑即可）' }
+  }
 }
 
 # ─── 主流程 ────────────────────────────────────────────────────────────────
@@ -540,34 +623,36 @@ if ($px.Url) {
 }
 
 if ($Rollback) { Invoke-Rollback $i; return }
-if ($Diagnose -or (-not $Ref -and -not $Yes)) {
-  Say ''
-  Say '── 可选操作 ─────────────────────────────────────────────────────' 'Cyan'
-  Say '  1) 只检查：本机版本 vs 上游目标版本，看有没有对应的预编译产物（不下载、不落地）'
-  Say '  2) 下载并覆盖产物（不跑 hermes update）'
-  Say '  3) 下载覆盖 + 运行 hermes update（推荐）'
-  Say '  4) 选一个具体 tag/SHA 再执行'
-  Say '  5) 回滚到上一次备份'
-  Say ("  6) 手动指定代理（当前：{0}）" -f $(if ($script:ProxyUrl) { $script:ProxyUrl } else { '直连' }))
-  Say '  0) 退出'
-  Say '─────────────────────────────────────────────────────────────────' 'Cyan'
-  if ($Diagnose) { return }
-  $choice = Read-Host '选择'
-  switch ($choice) {
-    '1' { $CheckOnly = $true }
-    '2' { $SkipUpdate = $true }
-    '3' { }
-    '4' { $Ref = Read-Host '  输入 tag / 分支 / SHA（如 v0.23.1）' }
-    '5' { Invoke-Rollback $i; return }
-    '6' {
-      $p = Read-Host '  输入代理（ip:端口 或 http://ip:端口 / socks5://ip:端口，留空=直连）'
-      if ($p) {
-        $u = if ($p -match '^[a-z0-9]+://') { $p } else { "http://$p" }
-        $script:ProxyUrl = $u; Set-ProxyEnv $u
-        if (-not (Test-Proxy $u)) { Warn '代理不通，仍会尝试（下载失败会报错）' }
-      } else { $script:ProxyUrl = $null; Set-ProxyEnv $null; Say '  已改为直连' 'Yellow' }
+if ($Diagnose) {
+  Show-Menu
+  return
+}
+
+# 菜单循环：选 1（只检查）/6（代理）后回到菜单，选 2/3/4 才进主流程
+if (-not $Ref -and -not $Yes) {
+  $go = $false
+  while (-not $go) {
+    Show-Menu
+    switch (Read-Host '选择') {
+      '1' { Show-Plan $i }
+      '2' { $SkipUpdate = $true; $go = $true }
+      '3' { $go = $true }
+      '4' {
+        $k = Read-Host '  输入 tag / 分支 / SHA（如 v0.23.3）'
+        if ($k) { $Ref = $k; $go = $true } else { Say '  没输入，回到菜单' 'Yellow' }
+      }
+      '5' { Invoke-Rollback $i; return }
+      '6' {
+        $p = Read-Host '  输入代理（ip:端口 或 http://ip:端口 / socks5://ip:端口，留空=直连）'
+        if ($p) {
+          $u = if ($p -match '^[a-z0-9]+://') { $p } else { "http://$p" }
+          $script:ProxyUrl = $u; Set-ProxyEnv $u
+          if (-not (Test-Proxy $u)) { Warn '代理不通，仍会尝试（下载失败会报错）' }
+        } else { $script:ProxyUrl = $null; Set-ProxyEnv $null; Say '  已改为直连' 'Yellow' }
+      }
+      '0' { return }
+      default { Say '  无效选择' 'Yellow' }
     }
-    default { return }
   }
 }
 
@@ -579,7 +664,7 @@ if ($i.Commit -eq $target.Sha) { Warn '本机已经在这个 commit 上，覆盖
 # 先把「桌面还开着」挡在下载之前：否则白下 200 MB 才被断言拦下（实测踩过）
 if (-not $DryRun -and -not $CheckOnly) { Assert-DesktopClosed $i }
 
-$art = Locate-Payload $i $target.Sha.Substring(0, 12)
+$art = Locate-Payload $i $target.Sha.Substring(0, 12) $target.Ref
 if (-not $art) {
   Warn ("找不到产物 {0}（CI 可能还没编这个 SHA，或已过期）" -f $target.Sha.Substring(0, 12))
   Say '  处理：在 hermes-prebuild 上手动 dispatch：' 'Yellow'
@@ -591,7 +676,10 @@ Ok ("找到产物 {0}（{1:N0} MB，通道={2}）" -f $art.Name, ($art.Size / 1M
 if ($CheckOnly) {
   Say ''
   $same = ($i.Commit -eq $target.Sha)
-  Say ("  本机 HEAD {0}   目标 {1}   → {2}" -f $i.Commit.Substring(0, 12), $target.Sha.Substring(0, 12),
+  $curV = if ($i.Version -and $i.Version -ne 'unknown') { "v$($i.Version)" } else { 'unknown' }
+  Say ("  当前版本：{0}    HEAD {1}" -f $curV, (SafeShort $i.Commit)) 'Cyan'
+  Say ("  目标版本：{0}    SHA  {1}" -f $target.Ref, (SafeShort $target.Sha)) 'Cyan'
+  Say ("  本机 HEAD {0}   目标 {1}   → {2}" -f (SafeShort $i.Commit), (SafeShort $target.Sha),
        $(if ($same) { '已对齐，直接覆盖产物即可' } else { '落后：脚本会先补源码快照再 checkout' })) 'Cyan'
   if ($same) { Ok '  结论：可以升级，覆盖 + 重签约 2 分钟，build 段 0 秒' }
   else       { Ok '  结论：可以升级，多一步源码灌对象（约 3-6 分钟）' }

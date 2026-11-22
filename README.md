@@ -196,7 +196,7 @@ Node 版本固定 `26.12.1`（取自 `pm/lock.json`），这是 receipt 校验�
 不带参数运行 = 先打印安装状态，再给菜单：
 
 ```
-  1) 只检查：本机版本 vs 目标版本，看有没有对应产物（不下载、不落地）
+  1) 只检查：当前版本 vs 目标版本，看有没有对应产物（不下载、不落地）
   2) 下载并覆盖产物（不跑 hermes update）
   3) 下载覆盖 + 运行 hermes update（推荐）
   4) 选一个具体 tag/SHA 再执行
@@ -204,6 +204,28 @@ Node 版本固定 `26.12.1`（取自 `pm/lock.json`），这是 receipt 校验�
   6) 手动指定代理（ip:端口 / http://… / socks5://…，留空=直连）
   0) 退出
 ```
+
+**菜单是循环的**：选 1（只检查）、6（代理）执行完会回到菜单，可以接着选别的；2/3/4 才真正进主流程。
+选 1 会打印一行对比，例如：
+
+```
+  当前版本：v0.23.2    HEAD ae2a81ccc00e
+  目标版本：v0.23.3    SHA  caafe5389ae5
+  OK   产物：hermes-win-x64-caafe5389ae5.zip（203 MB，release 通道）
+  !!   落后于目标：脚本会先取源码快照灌 git 对象再 checkout（多 3–6 分钟）
+```
+
+**桌面版正在运行时会停下来问你**（只在桌面版形态、且选 2/3/4 时）：
+
+```
+  !!   Hermes 桌面正在运行（pid 18068,21828,...）
+    1) 我自己去关（脚本退出，关好再重跑）
+    2) 现在结束这些进程（未保存的内容会丢）
+    0) 取消
+```
+
+判断依据是 `win-unpacked` / `linux-unpacked` 目录下的进程，**不会误杀 CLI/gateway**。
+非交互场景可以用 `-KillDesktop`（Windows）/ `--kill-desktop`（Linux）让它直接结束进程。
 
 ### 3.4 非交互 / 自动化
 
@@ -219,6 +241,7 @@ Node 版本固定 `26.12.1`（取自 `pm/lock.json`），这是 receipt 校验�
 | 强制直连 | `-NoProxy` | `--no-proxy` |
 | 产物通道 | `-Source auto\|release\|artifact` | `--source …` |
 | 安装形态 | `-Flavor auto\|desktop\|cli` | `--flavor …` |
+| 桌面在跑时直接结束它 | `-KillDesktop` | `--kill-desktop` |
 
 ```powershell
 # Windows

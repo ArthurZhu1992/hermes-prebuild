@@ -26,7 +26,7 @@ set -uo pipefail
 
 BUILDER_REPO="${BUILDER_REPO:-ArthurZhu1992/hermes-prebuild}"
 UPSTREAM="${UPSTREAM:-NousResearch/hermes-agent}"
-REF=""; DIAGNOSE=0; DRY_RUN=0; CHECK_ONLY=0; YES=0; SKIP_UPDATE=0; ROLLBACK=0; FLAVOR=auto
+REF=""; DIAGNOSE=0; DRY_RUN=0; CHECK_ONLY=0; YES=0; SKIP_UPDATE=0; ROLLBACK=0; FLAVOR=auto; KILL_DESKTOP=0
 PROXY_URL="${PROXY_URL:-}"; SKIP_PROXY=0
 SOURCE="${SOURCE:-auto}"   # auto | artifact | release
 STAMP_TS=$(date +%Y%m%d-%H%M%S)
@@ -42,6 +42,7 @@ while [ $# -gt 0 ]; do
     --source=*) SOURCE="${1#*=}"; shift;;
     --diagnose) DIAGNOSE=1; shift;;
     --check) CHECK_ONLY=1; shift;;
+    --kill-desktop) KILL_DESKTOP=1; shift;;
     --flavor) FLAVOR="$2"; shift 2;;
     --dry-run) DRY_RUN=1; shift;;
     -y|--yes) YES=1; shift;;
@@ -338,6 +339,27 @@ verify() {
   ok '校验通过：manifest / 烘焙 stamp / receipts 全部匹配'
 }
 
+# 菜单里的「只检查」：显示当前版本 → 目标版本，不下载
+show_plan() {
+  resolve_target
+  head_ ''
+  c '0;36' "  当前版本：v$(jget version)    HEAD $(jget commit | cut -c1-12)"
+  c '0;36' "  目标版本：$T_REF    SHA  ${T_SHA:0:12}"
+  if ! locate_payload; then
+    warn '  没有可用产物（CI 还没编这个版本，或资产已过期）'
+    say "  可手动触发：gh workflow run prebuild.yml -R $BUILDER_REPO -f ref=$T_REF"
+    head_ ''
+    return 0
+  fi
+  ok "  产物：$ART_NAME（$((ART_SIZE/1048576)) MB，$PAYLOAD_KIND 通道）"
+  if [ "$(jget commit)" = "$T_SHA" ]; then
+    ok '  已是目标版本：覆盖产物 + 重签约 2 分钟，build 段 0 秒'
+  else
+    warn '  落后于目标：脚本会先取源码快照灌 git 对象再 checkout（多 3–6 分钟）'
+  fi
+  head_ ''
+}
+
 # ─── 4. 备份 / 覆盖 / 回滚 ─────────────────────────────────────────────────
 ITEMS=(apps/desktop/release/linux-unpacked apps/desktop/dist apps/desktop/build/install-stamp.json \
        apps/desktop/build/native-deps apps/desktop/build/native-deps.prepared.json \
@@ -456,9 +478,30 @@ rollback() {
 
 assert_closed() {
   is_desktop || return 0
-  if pgrep -f 'linux-unpacked/Hermes' >/dev/null 2>&1; then
-    die 'Hermes 桌面正在运行，请先退出（它锁着 linux-unpacked）'
+  local pids ans
+  pids=$(pgrep -f 'linux-unpacked/Hermes' | tr '\n' ' ')
+  [ -n "${pids:-}" ] || return 0
+  warn "Hermes 桌面正在运行（pid $pids）—— 它锁着 linux-unpacked"
+  if [ "$KILL_DESKTOP" = 1 ]; then
+    say '  按 --kill-desktop 结束这些进程...'
+    pkill -f 'linux-unpacked/Hermes' 2>/dev/null || true
+    sleep 2
+    pgrep -f 'linux-unpacked/Hermes' >/dev/null 2>&1 && die '仍有桌面进程没退出，请手动结束'
+    ok '已结束桌面进程'; return 0
   fi
+  [ "$YES" = 1 ] && die '请先退出桌面版（或加 --kill-desktop 让脚本代劳）'
+  say '    1) 我自己去关（脚本退出，关好再重跑）'
+  say '    2) 现在结束这些进程（未保存的内容会丢）'
+  say '    0) 取消'
+  read -r -p '选择: ' ans || die '已取消'
+  case "$ans" in
+    2)
+      pkill -f 'linux-unpacked/Hermes' 2>/dev/null || true
+      sleep 2
+      pgrep -f 'linux-unpacked/Hermes' >/dev/null 2>&1 && die '仍有桌面进程没退出，请手动结束'
+      ok '已结束桌面进程，继续' ;;
+    *) die '已取消（退出桌面后重跑即可）' ;;
+  esac
 }
 
 # ─── 主流程 ────────────────────────────────────────────────────────────────
@@ -487,9 +530,11 @@ fi
 [ "$ROLLBACK" = 1 ] && { rollback; exit 0; }
 
 if [ "$DIAGNOSE" = 1 ] || { [ -z "$REF" ] && [ "$YES" = 0 ]; }; then
-  head_ ''; head_ '── 可选操作 ─────────────────────────────────────────────────────'
-  cat <<'MENU'
-  1) 只检查：本机版本 vs 目标版本，看有没有对应产物（不下载、不落地）
+  # 菜单循环：1（只检查）/ 6（代理）执行完回到菜单，2/3/4 才进主流程
+  while :; do
+    head_ ''; head_ '── 可选操作 ─────────────────────────────────────────────────────'
+    cat <<'MENU'
+  1) 只检查：当前版本 vs 目标版本，看有没有对应产物（不下载、不落地）
   2) 下载并覆盖产物（不跑 hermes update）
   3) 下载覆盖 + 运行 hermes update（推荐）
   4) 选一个具体 tag/SHA 再执行
@@ -497,26 +542,29 @@ if [ "$DIAGNOSE" = 1 ] || { [ -z "$REF" ] && [ "$YES" = 0 ]; }; then
   6) 手动指定代理（ip:端口 / http://… / socks5://…，留空=直连）
   0) 退出
 MENU
-  head_ '─────────────────────────────────────────────────────────────────'
-  [ "$DIAGNOSE" = 1 ] && exit 0
-  read -r -p '选择: ' choice
-  case "$choice" in
-    1) CHECK_ONLY=1 ;;
-    2) SKIP_UPDATE=1 ;;
-    3) : ;;
-    4) read -r -p '  输入 tag/分支/SHA（如 v0.23.1）: ' REF ;;
-    5) rollback; exit 0 ;;
-    6)
-      read -r -p '  输入代理（留空=直连）: ' p
-      if [ -n "$p" ]; then
-        case "$p" in *://*) PX="$p";; *) PX="http://$p";; esac
-        apply_proxy; test_proxy || warn '代理不通，仍会尝试（下载失败会报错）'
-      else
-        PX=""; unset HTTPS_PROXY HTTP_PROXY ALL_PROXY https_proxy http_proxy all_proxy; warn '已改为直连'
-      fi
-      ;;
-    *) exit 0 ;;
-  esac
+    head_ '─────────────────────────────────────────────────────────────────'
+    [ "$DIAGNOSE" = 1 ] && exit 0
+    read -r -p '选择: ' choice || exit 0
+    case "$choice" in
+      1) show_plan ;;
+      2) SKIP_UPDATE=1; break ;;
+      3) break ;;
+      4)
+        read -r -p '  输入 tag / 分支 / SHA（如 v0.23.3）: ' k
+        if [ -n "${k:-}" ]; then REF="$k"; break; else warn '  没输入，回到菜单'; fi ;;
+      5) rollback; exit 0 ;;
+      6)
+        read -r -p '  输入代理（留空=直连）: ' p
+        if [ -n "${p:-}" ]; then
+          case "$p" in *://*) PX="$p";; *) PX="http://$p";; esac
+          apply_proxy; test_proxy || warn '代理不通，仍会尝试（下载失败会报错）'
+        else
+          PX=""; unset HTTPS_PROXY HTTP_PROXY ALL_PROXY https_proxy http_proxy all_proxy; warn '已改为直连'
+        fi ;;
+      0|"") exit 0 ;;
+      *) warn '  无效选择' ;;
+    esac
+  done
 fi
 
 resolve_target
